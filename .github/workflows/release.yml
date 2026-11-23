@@ -1,0 +1,33 @@
+name: Release shared profile library to Ciyan
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: pwa-google-drive-release
+  cancel-in-progress: false
+jobs:
+  notify-ciyan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm test && npm run check
+      - name: Notify Ciyan dependency update
+        env:
+          TOKEN: ${{ secrets.CIYAN_DISPATCH_TOKEN }}
+          SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$TOKEN" ]]; then echo '::error::Set CIYAN_DISPATCH_TOKEN in PWA-GoogleDrive'; exit 1; fi
+          jq -n --arg sha "$SHA" '{event_type:"google-drive-release",client_payload:{sha:$sha}}' > /tmp/dispatch.json
+          curl --fail-with-body --silent --show-error --retry 3 -X POST \
+            -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            --data-binary @/tmp/dispatch.json \
+            https://api.github.com/repos/tanner-voas/Ciyan/dispatches
