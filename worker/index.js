@@ -71,7 +71,7 @@ export class AccountCoordinator {
    if(input.path==='/logout'&&input.method==='POST'){await this.ctx.storage.delete(`session:${input.sid}`);return json({disconnected:true});}
    if(input.path==='/status'&&input.method==='GET')return json({connected:true,email:session.email});
    return await this.route(input);
-  }catch(e){const msg=String(e.message||e);if(msg.startsWith('Google authorization expired'))return error(401,msg);if(msg.startsWith('Conflict:'))return error(409,msg.slice(9));return error(502,'Google Drive operation failed. Local data is safe; retry later.');}};
+  }catch(e){const msg=String(e.message||e);if(msg.startsWith('Google authorization expired'))return error(401,msg);if(msg.startsWith('Conflict:'))return error(409,msg.slice(9));const code=/Drive API (403|404|429|5\d\d)/.exec(msg)?.[1];return error(502,code?`Google Drive returned HTTP ${code}; local data is safe. Retry or check Cloudflare logs.`:'Google Drive operation failed. Local data is safe; retry later.',{stage:input.path});}};
   return this.serial(run);
  }
  serial(fn){const next=this.queue.then(fn,fn);this.queue=next.then(()=>{},()=>{});return next;}
@@ -140,7 +140,8 @@ export class AccountCoordinator {
      if((current?.id||null)!==(payload.expected??null))return error(409,'Confirmed revision divergence',{head:current});
      if(revision.parent!==(payload.expected??null))return error(400,'Revision parent mismatch');
      const objects=(await this.folders(true)).objects;
-     for(const hash of new Set(Object.values(revision.sections))){if(!(await this.list(objects,`${hash}.json`)).length)return error(400,'Revision references an unuploaded section');}
+     const present=new Set((await this.list(objects)).map(f=>f.name));
+     for(const hash of new Set(Object.values(revision.sections))){if(!present.has(`${hash}.json`))return error(400,'Revision references an unuploaded section');}
      await this.createJSON(folder,`r_${revision.id}.json`,JSON.stringify(revision));
      if(h.file)await this.replaceJSON(h.file.id,JSON.stringify(revision));else await this.createJSON(folder,'head.json',JSON.stringify(revision));
      // Cleanup is opportunistic; a failure must not invalidate a successful save.
@@ -156,6 +157,44 @@ export class AccountCoordinator {
      return json({head:revision});
     }
    }
+  }
+  if(method==='POST'&&path==='/objects/read-batch'){
+   const hashes=payload.hashes;
+   if(!Array.isArray(hashes)||!hashes.length||hashes.length>8||hashes.some(hash=>!SHA.test(hash)))return error(400,'Invalid download batch');
+   const objects=(await this.folders(false))?.objects;
+   if(!objects)return error(404,'Backup objects do not exist');
+   const listing=new Map((await this.list(objects)).map(f=>[f.name,f.id]));
+   const result={};
+   for(let i=0;i<hashes.length;i+=3){
+    await Promise.all(hashes.slice(i,i+3).map(async hash=>{
+     const id=listing.get(`${hash}.json`);if(!id)throw Error('Missing backup section');
+     const content=await this.content(id);
+     if(hex(await crypto.subtle.digest('SHA-256',enc.encode(content)))!==hash)throw Error('Stored backup section failed integrity check');
+     result[hash]=JSON.parse(content);
+    }));
+   }
+   return json({objects:result});
+  }
+  if(method==='POST'&&path==='/objects/batch'){
+   const batch=payload.objects;
+   if(!Array.isArray(batch)||!batch.length||batch.length>12)return error(400,'Invalid section batch');
+   const verified=[];
+   let total=0;
+   for(const item of batch){
+    if(!item||!SHA.test(item.hash)||typeof item.content!=='string')return error(400,'Invalid section');
+    const bytes=enc.encode(item.content);total+=bytes.length;
+    if(bytes.length>16*1024*1024||total>1024*1024)return error(413,'Section batch too large');
+    if(hex(await crypto.subtle.digest('SHA-256',bytes))!==item.hash)return error(400,'Section hash mismatch');
+    verified.push(item);
+   }
+   const objects=(await this.folders(true)).objects;
+   const known=new Set((await this.list(objects)).map(f=>f.name));
+   const missing=[...new Map(verified.filter(item=>!known.has(`${item.hash}.json`)).map(item=>[item.hash,item])).values()];
+   // Bounded concurrency prevents both excessive Drive calls and slow initial saves.
+   for(let i=0;i<missing.length;i+=3){
+    await Promise.all(missing.slice(i,i+3).map(item=>this.createJSON(objects,`${item.hash}.json`,item.content)));
+   }
+   return json({stored:verified.length,created:missing.length});
   }
   if(segments[0]==='objects'&&SHA.test(segments[1]||'')){
    const hash=segments[1];

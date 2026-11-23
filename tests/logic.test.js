@@ -1,6 +1,6 @@
 import test from 'node:test';import assert from 'node:assert/strict';
 import {retainedIds,checkRevision} from '../src/retention.js';
-import {readRegistry,renameProfile,selectProfile,upsertProfile} from '../src/profiles.js';
+import {readRegistry,renameProfile,selectProfile,upsertProfile,setProfileRemote} from '../src/profiles.js';
 const mock=()=>{const data=new Map();return {getItem:key=>data.get(key)||null,setItem:(k,v)=>data.set(k,v)};};
 test('initial profile persists a permanent ID and allows rename',()=>{
  const storage=mock();const a=readRegistry(storage);assert.equal(a.profiles[0].name,'Default');assert.equal(readRegistry(storage).active,a.active);
@@ -34,3 +34,5 @@ test('lost commit response never marks newer local changes as uploaded',async()=
  try{const result=await uploadBackup('profile','ciyan',newer,cursor);assert.equal(result.status,'committed');assert.equal(result.stale,true);assert.equal(result.head.id,'old-commit');}
  finally{globalThis.fetch=saved;}
 });
+
+test('incomplete legacy cloud profile can return to local mode without losing identity',()=>{const storage=mock();const p=readRegistry(storage);setProfileRemote(p.active,true,storage);assert.equal(readRegistry(storage).profiles[0].remote,true);setProfileRemote(p.active,false,storage);assert.equal(readRegistry(storage).profiles[0].remote,false);assert.equal(readRegistry(storage).active,p.active);});

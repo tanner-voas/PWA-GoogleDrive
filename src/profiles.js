@@ -15,6 +15,7 @@ export function getProfiles(storage=globalThis.localStorage){return structuredCl
 function edit(modify,storage=globalThis.localStorage){const current=readRegistry(storage);const next=structuredClone(current);modify(next);storage.setItem(KEY,JSON.stringify(next));globalThis.dispatchEvent?.(new CustomEvent(PROFILE_EVENT,{detail:{active:next.active}}));return next;}
 export function selectProfile(id,storage){return edit(data=>{if(!data.profiles.some(p=>p.id===id))throw Error('Unknown profile');data.active=id;},storage);}
 export function renameProfile(id,name,storage){name=safeName(name);if(!name)throw Error('Profile name cannot be empty');return edit(data=>{const found=data.profiles.find(p=>p.id===id);if(!found)throw Error('Unknown profile');found.name=name;},storage);}
+export function setProfileRemote(id,remote,storage){return edit(data=>{const found=data.profiles.find(p=>p.id===id);if(!found)throw Error('Unknown profile');found.remote=!!remote;},storage);}
 export function upsertProfile({id,name,remote=false},storage){if(!/^[a-zA-Z0-9_-]{1,80}$/.test(id))throw Error('Invalid profile ID');name=safeName(name);if(!name)throw Error('Profile name required');return edit(data=>{const found=data.profiles.find(p=>p.id===id);if(found){found.name=name;found.remote=found.remote||remote;}else data.profiles.push({id,name,remote,createdAt:new Date().toISOString()});},storage);}
 export function forkProfile(sourceId,name,storage){const id=globalThis.crypto.randomUUID();upsertProfile({id,name,remote:false},storage);return id;}
 export async function api(path='',opts={}){

@@ -42,52 +42,101 @@ export function reconstructBackup(revision,entries){
  return {format:revision.meta.format,version:revision.meta.version,appVersion:revision.meta.appVersion,state};
 }
 export async function fetchRevision(profileId,appId){return api(`/profiles/${profileId}/apps/${appId}/head`);}
-export async function downloadBackup(profileId,appId,revision){
+export async function downloadBackup(profileId,appId,revision,onProgress=()=>{}){
  if(!revision?.sections)throw Error('No cloud backup exists for this app');
- const entries=await Promise.all(Object.entries(revision.sections).map(async([key,hash])=>[key,(await api(`/objects/${hash}`)).value]));
- return reconstructBackup(revision,Object.fromEntries(entries));
+ const hashes=[...new Set(Object.values(revision.sections))],values={};
+ for(let i=0;i<hashes.length;i+=8){
+  const group=hashes.slice(i,i+8);
+  const response=await api('/objects/read-batch',{method:'POST',body:JSON.stringify({hashes:group})});
+  Object.assign(values,response.objects);
+  onProgress({completed:Math.min(i+8,hashes.length),total:hashes.length,stage:'downloading'});
+ }
+ const entries=Object.fromEntries(Object.entries(revision.sections).map(([key,hash])=>[key,values[hash]]));
+ return reconstructBackup(revision,entries);
 }
 /** Return committed, unchanged, or divergent. Network failures never produce forks. */
-export async function uploadBackup(profileId,appId,backup,cursor){
+export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{}}={}){
  const data=await splitBackup(backup);const revisionId=crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
  const remote=await fetchRevision(profileId,appId);
  // On reconnect, verify the last known parent; if it changed, let caller fork.
  const expected=cursor?.head??null;
- if(remote.head?.id!==expected){
+ if((remote.head?.id??null)!==expected){
   if(remote.head?.operationId===operationId)return {status:'committed',head:remote.head,stale:JSON.stringify(remote.head.sections)!==JSON.stringify(data.sections)};
   return {status:'divergent',head:remote.head,expected};
  }
  if(remote.head&&JSON.stringify(remote.head.sections)===JSON.stringify(data.sections))return {status:'unchanged',head:remote.head};
  const known=new Set(Object.values(remote.head?.sections||{}));
- for(const [hash,content] of Object.entries(data.payloads)){
-  if(known.has(hash))continue;
-  await api(`/objects/${hash}`,{method:'PUT',headers:{'Content-Type':'application/json','X-PWA-CSRF':'1'},body:content});
+ const pending=Object.entries(data.payloads).filter(([hash])=>!known.has(hash));
+ const batches=[];let batch=[],bytes=0;
+ for(const [hash,content] of pending){
+  const size=new TextEncoder().encode(content).length;
+  if(size>16*1024*1024)throw Error('Backup section exceeds 16 MiB');
+  if(batch.length&&(batch.length>=12||bytes+size>512*1024)){batches.push(batch);batch=[];bytes=0;}
+  batch.push({hash,content});bytes+=size;
  }
+ if(batch.length)batches.push(batch);
+ let completed=0;
+ onProgress({completed,total:pending.length,stage:'uploading'});
+ // Worker validates all hashes and stores each batch before acknowledging it.
+ for(const group of batches){
+  await api('/objects/batch',{method:'POST',body:JSON.stringify({objects:group})});
+  completed+=group.length;onProgress({completed,total:pending.length,stage:'uploading'});
+ }
+ onProgress({completed,total:pending.length,stage:'committing'});
  const revision={format:1,id:revisionId,operationId,parent:expected,sections:data.sections,meta:data.meta,at:new Date().toISOString()};
  try{const done=await api(`/profiles/${profileId}/apps/${appId}/commit`,{method:'POST',body:JSON.stringify({expected,revision})});return {status:'committed',head:done.head};}
  catch(error){if(error.status===409)return {status:'divergent',head:error.details.head,expected};throw error;}
 }
-/** Debounced; only one upload at a time; retries retain the same operation ID. */
+/** Debounced sync, visible progress and a truthful manual completion result. */
 export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDivergence}){
- let timer=null,maxTimer=null,running=false,dirty=false,stopped=false,lastRun=0,failures=0;
+ let timer=null,maxTimer=null,running=null,dirty=false,stopped=false,failures=0;
  let cursor=getSyncCursor(profileId,appId)||{head:null,localRevision:null,pendingOperationId:null};
  const publish=(phase,extra={})=>onStatus?.({phase,...extra});
  const persist=()=>setSyncCursor(profileId,appId,cursor);
- async function flush(){if(stopped||running||!dirty)return;if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}clearTimeout(timer);clearTimeout(maxTimer);maxTimer=null;running=true;dirty=false;publish('syncing');
+ function schedule(ms=5000){if(stopped)return;clearTimeout(timer);timer=setTimeout(()=>{void flush().catch(()=>{});},ms);}
+ async function execute(){
+  if(stopped)throw Error('Synchronization is stopped');
+  dirty=false;publish('syncing');
   try{
-   const input=await readBackup(),result=await uploadBackup(profileId,appId,input.backup,cursor);
+   const input=await readBackup();
+   const result=await uploadBackup(profileId,appId,input.backup,cursor,{onProgress:progress=>publish('syncing',progress)});
    if(result.status==='divergent'){
-    // Do not fork on an error, timeout, or merely stale local metadata.
-    // Caller must verify remote and local revisions and complete the fork atomically.
-    publish('conflict');await onDivergence?.(result,input,cursor);return;
+    publish('conflict');await onDivergence?.(result,input,cursor);
+    return {status:'conflict'};
    }
-   cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null};persist();failures=0;lastRun=Date.now();if(result.stale){dirty=true;publish('pending');}else publish('synced',{revision:input.revision});
-  }catch(error){dirty=true;failures++;publish('error',{error});}
-  finally{running=false;if(dirty&&!stopped){if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}schedule(failures?Math.min(60000,2000*2**Math.min(failures,5)):4000);}}
+   cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null};
+   persist();failures=0;
+   if(result.stale){dirty=true;publish('pending');}
+   else publish('synced',{revision:input.revision});
+   return {status:result.stale?'pending':result.status,head:result.head};
+  }catch(error){dirty=true;failures++;publish('error',{error});throw error;}
+  finally{if(dirty&&!stopped)schedule(failures?Math.min(60000,2000*2**Math.min(failures,5)):4000);}
  }
- function schedule(ms=5000){if(stopped)return;clearTimeout(timer);timer=setTimeout(flush,ms);}
- function changed(){if(stopped)return;dirty=true;if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}schedule(5000);if(!maxTimer)maxTimer=setTimeout(()=>void flush(),60000);}
- async function now(){if(stopped)return;dirty=true;clearTimeout(timer);clearTimeout(maxTimer);await flush();}
+ function flush(){
+  if(stopped)return Promise.reject(Error('Synchronization is stopped'));
+  if(running)return running;
+  if(!dirty)return Promise.resolve({status:'unchanged',head:cursor.head});
+  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}
+  clearTimeout(timer);clearTimeout(maxTimer);maxTimer=null;
+  running=execute().finally(()=>{running=null;});
+  return running;
+ }
+ function changed(){
+  if(stopped)return;
+  dirty=true;
+  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}
+  schedule();if(!maxTimer)maxTimer=setTimeout(()=>{void flush().catch(()=>{});},60000);
+  publish('pending');
+ }
+ async function now(){
+  if(stopped)throw Error('Synchronization is stopped');
+  if(running){await running;}
+  if(!dirty)dirty=true; // Explicit sync verifies unchanged content as well.
+  const result=await flush();
+  if(result.status==='conflict')throw Error('A different cloud revision was found; local data was preserved');
+  if(result.status==='pending')return now(); // Retry a newer local revision after a lost response.
+  return result;
+ }
  function stop(){stopped=true;clearTimeout(timer);clearTimeout(maxTimer);}
  return {changed,now,stop,flush,get cursor(){return cursor;}};
 }

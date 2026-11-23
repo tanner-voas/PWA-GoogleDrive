@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.2
+# PWA-GoogleDrive v0.1.3
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
@@ -33,3 +33,7 @@ See `SETUP.md` for full creation/deployment and the per-repo `gamp` order. Both 
 - The first local profile retains Ciyan's legacy database, with its contents unchanged. All subsequent profiles use independent IndexedDB databases.
 - On an unrecognized local/cloud state without common sync history the app halts syncing rather than guessing.
 - Full-account mark-and-sweep runs opportunistically after commits; Cloudflare/Drive outages can delay reclamation.
+
+## v0.1.3 upload reliability
+
+The first-upload revision comparison now treats a missing head as `null` on both sides (v0.1.2 incorrectly treated it as divergence). Sections are batched in bounded requests; the Worker validates content hashes and confirms the entire object set with a single listing before committing the head. Restoration verifies downloaded checksums in small batches. The sync scheduler exposes real upload results/errors and progress; network failures do not turn into profile forks.
