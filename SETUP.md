@@ -1,4 +1,4 @@
-# Full installation and setup — PWA-GoogleDrive v0.1.1
+# Full installation and setup — PWA-GoogleDrive v0.1.2
 
 **Baseline:** AppLauncher v0.1.6 → v0.1.7 and Ciyan v0.9.6 (Unified Header release) → v0.9.7. This does **not** apply on top of the deferred Ciyan v0.9.6 Google Drive prototype. The original Google Drive branch remains separate.
 
@@ -64,9 +64,9 @@ The workflows are deliberately one-directional:
 4. Scopes for OAuth: `openid`, `email`, `https://www.googleapis.com/auth/drive.file`. `drive.file` deliberately only covers Drive files created/selected by the app; no full-Drive permission required.
 5. Create an **OAuth client ID → Web application**. Register the exact authorized redirect URIs, using your actual Workers hostnames:
 
-   `https://applauncher.<YOUR_SUBDOMAIN>.workers.dev/_profiles/v1/auth/callback`
+   `https://applauncher.tannervoas.workers.dev/_profiles/v1/auth/callback`
 
-   `https://ciyan.<YOUR_SUBDOMAIN>.workers.dev/_profiles/v1/auth/callback`
+   `https://ciyan.tannervoas.workers.dev/_profiles/v1/auth/callback`
 
    If you use custom domains, also register the exact custom-domain callback URLs and use those origins in ALLOWED_ORIGINS.
 6. Save the **Client ID** and **Client Secret**. The client secret belongs only in the Cloudflare Worker secret store, never in the Git repository or browser.
@@ -74,19 +74,26 @@ The workflows are deliberately one-directional:
 
 ## 4. Deploy the Cloudflare authentication/storage Worker
 
-Change `ALLOWED_ORIGINS` in the new repo's `wrangler.jsonc` to exactly your deployment origins, separated by commas, without trailing slashes. This file contains **origins only**, not credentials.
+The v0.1.2 patch preconfigures `ALLOWED_ORIGINS` in `wrangler.jsonc` for both live deployments: `https://applauncher.tannervoas.workers.dev` and `https://ciyan.tannervoas.workers.dev`. This file contains **origins only**, not credentials. Keep it updated if you later change domains.
+
+**This Git patch cannot configure Cloudflare secrets or log in to Cloudflare.** Run the following commands after applying and pushing the patch. `wrangler deploy` first creates the Worker so secrets can be added reliably:
 
 ```sh
 cd /mnt/wcopy/apps/PWA-GoogleDrive
 npx --yes wrangler@4 login
+npx --yes wrangler@4 deploy
 npx --yes wrangler@4 secret put GOOGLE_CLIENT_ID
 npx --yes wrangler@4 secret put GOOGLE_CLIENT_SECRET
-openssl rand -base64 48 | tr -d '\n' | npx --yes wrangler@4 secret put SESSION_SIGNING_KEY
-openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n' | npx --yes wrangler@4 secret put VAULT_KEY
+# Generate a signing key. Save this output in a secure password manager.
+node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"
+npx --yes wrangler@4 secret put SESSION_SIGNING_KEY
+# Generate a DIFFERENT encryption key. Save this output securely too.
+node -e "console.log(require('node:crypto').randomBytes(32).toString('base64url'))"
+npx --yes wrangler@4 secret put VAULT_KEY
 npx --yes wrangler@4 deploy
 ```
 
-If Wrangler asks you to deploy first before accepting secrets, deploy once, then set the secrets and deploy again. Worker name must be **`pwa-profiles-api`**. It creates a SQLite Durable Object binding named `ACCOUNTS` via the included migration; Google refresh tokens are encrypted before storage. Check Cloudflare Workers & Pages → `pwa-profiles-api` → Bindings/Secrets. None of the secret values should appear in source control.
+Use your actual Google OAuth Client ID and Client Secret at the first two prompts. For `SESSION_SIGNING_KEY` and `VAULT_KEY`, paste the values printed by the corresponding Node commands. Keep the generated keys in a secure password manager so you can restore the Worker configuration later, especially the vault key. **Never commit keys or paste them in chat.** Worker name must be **`pwa-profiles-api`**. It creates a SQLite Durable Object binding named `ACCOUNTS` via the included migration; Google refresh tokens are encrypted before storage. Check Cloudflare Workers & Pages → `pwa-profiles-api` → Bindings/Secrets. None of the secret values should appear in source control.
 
 A browser direct request to the worker's `workers.dev` host is not the intended UI entrypoint. Requests go through `/_profiles/v1` on AppLauncher or standalone Ciyan, proxied using their `PROFILES` service bindings.
 
