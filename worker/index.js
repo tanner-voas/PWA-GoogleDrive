@@ -142,19 +142,40 @@ export class AccountCoordinator {
      const objects=(await this.folders(true)).objects;
      const present=new Set((await this.list(objects)).map(f=>f.name));
      for(const hash of new Set(Object.values(revision.sections))){if(!present.has(`${hash}.json`))return error(400,'Revision references an unuploaded section');}
-     await this.createJSON(folder,`r_${revision.id}.json`,JSON.stringify(revision));
-     if(h.file)await this.replaceJSON(h.file.id,JSON.stringify(revision));else await this.createJSON(folder,'head.json',JSON.stringify(revision));
-     // Cleanup is opportunistic; a failure must not invalidate a successful save.
-     if(Date.now()-this.lastPrune>24*3600000){this.lastPrune=Date.now();try{await this.prune(folder,revision.id);}catch{}}
-     // Content-addressed objects are collected only after ALL retained heads
-     // and history manifests across ALL profiles have been scanned successfully.
-     // Run maintenance after replying; it must not hold up user-visible saves.
+     // Revision creation and head update are separate Drive requests. If the
+     // first succeeded and the second failed, retry the SAME revision ID.
+     const revisionName=`r_${revision.id}.json`;
+     const existingRevision=(await this.list(folder,revisionName))[0];
+     let committedRevision=revision;
+     if(existingRevision){
+       const staged=checkRevision(JSON.parse(await this.content(existingRevision.id)));
+       // The timestamp naturally changes between attempts; immutable identity
+       // and actual snapshot content must match, not the retry wall clock.
+       if(staged.operationId!==revision.operationId||staged.parent!==revision.parent||
+          JSON.stringify(staged.sections)!==JSON.stringify(revision.sections)||
+          JSON.stringify(staged.meta)!==JSON.stringify(revision.meta))
+         return error(409,'Revision ID already belongs to different content');
+       committedRevision=staged;
+     }else await this.createJSON(folder,revisionName,JSON.stringify(revision));
+     if(h.file)await this.replaceJSON(h.file.id,JSON.stringify(committedRevision));
+     else await this.createJSON(folder,'head.json',JSON.stringify(committedRevision));
+     // Successful cloud commit must not wait for pruning or mark/sweep.
+     // Durable Object storage persists maintenance checkpoints across restarts.
      this.ctx.waitUntil(this.serial(async()=>{
-       try{const last=await this.ctx.storage.get('last-gc')||0;
-         if(Date.now()-last>7*86400000){await this.collectGarbage();await this.ctx.storage.put('last-gc',Date.now());}}
-       catch{} // Never risk deleting user data after incomplete traversal.
+       try{
+         const lastPrune=await this.ctx.storage.get('last-prune')||0;
+         if(Date.now()-lastPrune>24*3600000){
+           await this.prune(folder,revision.id);
+           await this.ctx.storage.put('last-prune',Date.now());
+         }
+         const last=await this.ctx.storage.get('last-gc')||0;
+         if(Date.now()-last>7*86400000){
+           await this.collectGarbage();
+           await this.ctx.storage.put('last-gc',Date.now());
+         }
+       }catch{} // Maintenance must never turn a successful backup into a failure.
      }));
-     return json({head:revision});
+     return json({head:committedRevision});
     }
    }
   }

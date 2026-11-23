@@ -40,6 +40,14 @@ export async function splitBackup(backup){
     books.push({id,token,count:chapters.length,fields,positions});
    }
    layout[key]={type:'reader',books};
+  }else if(key==='readerContent'&&data&&typeof data==='object'&&!Array.isArray(data)){
+   // Optional user-supplied text: one immutable object per chapter digest.
+   // The reader's content hash becomes the stable chunk identity.
+   const digests=Object.keys(data).sort();
+   for(const digest of digests){if(!/^[a-f0-9]{64}$/.test(digest)||typeof data[digest]!=='string')throw Error('Invalid portable reader text');
+    await add(`readerText_${digest.slice(0,48)}`,data[digest]);
+   }
+   layout[key]={type:'reader-text',digests};
   }else if(key==='skillSchedules'&&data&&typeof data==='object'&&!Array.isArray(data)){
    const modes=Object.keys(data);
    layout[key]={type:'mode-buckets',modes,parts:SKILL_PARTS};
@@ -71,6 +79,10 @@ export function reconstructBackup(revision,entries){
    if(parts.length!==spec.count)throw Error('Incomplete history partition');state[key]=parts;
   }else if(spec.type==='buckets'){
    const parts={};for(let i=0;i<spec.parts;i++){const chunk=entries[`${key}_${i}`];if(!chunk||Array.isArray(chunk))throw Error('Missing dictionary partition');Object.assign(parts,chunk);}state[key]=parts;
+  }else if(spec.type==='reader-text'){
+   const content={};
+   for(const digest of spec.digests){const text=entries[`readerText_${digest.slice(0,48)}`];if(typeof text!=='string')throw Error('Missing portable reader text');content[digest]=text;}
+   state[key]=content;
   }else if(spec.type==='mode-buckets'){
    const modes={};
    for(const mode of spec.modes){const part={};for(let i=0;i<spec.parts;i++){
@@ -116,7 +128,7 @@ export async function downloadBackup(profileId,appId,revision,onProgress=()=>{})
 }
 /** Return committed, unchanged, or divergent. Network failures never produce forks. */
 export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{}}={}){
- const data=await splitBackup(backup);const revisionId=crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
+ const data=await splitBackup(backup);const revisionId=cursor?.pendingRevisionId||crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
  const remote=await fetchRevision(profileId,appId);
  // On reconnect, verify the last known parent; if it changed, let caller fork.
  const expected=cursor?.head??null;
@@ -150,7 +162,7 @@ export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=
 /** Debounced sync, visible progress and a truthful manual completion result. */
 export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDivergence}){
  let timer=null,maxTimer=null,running=null,dirty=false,stopped=false,failures=0;
- let cursor=getSyncCursor(profileId,appId)||{head:null,localRevision:null,pendingOperationId:null};
+ let cursor=getSyncCursor(profileId,appId)||{head:null,localRevision:null,pendingOperationId:null,pendingRevisionId:null,pendingLocalRevision:null};
  const publish=(phase,extra={})=>onStatus?.({phase,...extra});
  const persist=()=>setSyncCursor(profileId,appId,cursor);
  function schedule(ms=5000){if(stopped)return;clearTimeout(timer);timer=setTimeout(()=>{void flush().catch(()=>{});},ms);}
@@ -159,12 +171,18 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
   dirty=false;publish('syncing');
   try{
    const input=await readBackup();
-   const result=await uploadBackup(profileId,appId,input.backup,cursor,{onProgress:progress=>publish('syncing',progress)});
+   if(cursor.pendingLocalRevision!==null&&cursor.pendingLocalRevision!==undefined&&cursor.pendingLocalRevision!==input.revision){
+    // The previous attempt may have staged a different snapshot. Never reuse
+    // its immutable revision name for a newly edited local snapshot.
+    cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();
+   }
+   cursor.pendingLocalRevision=input.revision;persist();
+   const result=await uploadBackup(profileId,appId,input.backup,{...cursor},{onProgress:progress=>publish('syncing',progress)});
    if(result.status==='divergent'){
     publish('conflict');await onDivergence?.(result,input,cursor);
     return {status:'conflict'};
    }
-   cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null};
+   cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null,pendingRevisionId:null,pendingLocalRevision:null};
    persist();failures=0;
    if(result.stale||dirty){dirty=true;publish('pending');}
    else publish('synced',{revision:input.revision});
@@ -176,7 +194,8 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
   if(stopped)return Promise.reject(Error('Synchronization is stopped'));
   if(running)return running;
   if(!dirty)return Promise.resolve({status:'unchanged',head:cursor.head});
-  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}
+  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();cursor.pendingLocalRevision=null;persist();}
+  else if(!cursor.pendingRevisionId){cursor.pendingRevisionId=crypto.randomUUID();persist();}
   clearTimeout(timer);clearTimeout(maxTimer);maxTimer=null;
   running=execute().finally(()=>{running=null;});
   return running;
@@ -184,7 +203,8 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
  function changed(){
   if(stopped)return;
   dirty=true;
-  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();persist();}
+  if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();cursor.pendingLocalRevision=null;persist();}
+  else if(!cursor.pendingRevisionId){cursor.pendingRevisionId=crypto.randomUUID();persist();}
   schedule();if(!maxTimer)maxTimer=setTimeout(()=>{void flush().catch(()=>{});},60000);
   publish('pending');
  }

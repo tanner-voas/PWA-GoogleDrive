@@ -36,3 +36,25 @@ test('lost commit response never marks newer local changes as uploaded',async()=
 });
 
 test('incomplete legacy cloud profile can return to local mode without losing identity',()=>{const storage=mock();const p=readRegistry(storage);setProfileRemote(p.active,true,storage);assert.equal(readRegistry(storage).profiles[0].remote,true);setProfileRemote(p.active,false,storage);assert.equal(readRegistry(storage).profiles[0].remote,false);assert.equal(readRegistry(storage).active,p.active);});
+
+import {ProfileRegistryCorruptError,candidateRegistry,recoverRegistry} from '../src/profiles.js';
+test('damaged profile registry is never replaced silently',()=>{
+ const examples=['{bad JSON','{"version":2,"profiles":[]}',JSON.stringify({version:1,active:'a',legacyId:'a',profiles:[{id:'a',name:'A'},{id:'a',name:'Duplicate'}]})];
+ for(const raw of examples){const storage=mock();storage.setItem('pwa.profiles.v1',raw);
+  assert.throws(()=>readRegistry(storage),ProfileRegistryCorruptError);
+  assert.equal(storage.getItem('pwa.profiles.v1'),raw);
+ }
+});
+test('recovery rescues recognizable IndexedDB identities and preserves raw metadata',()=>{
+ const storage=mock(),raw='{bad';storage.setItem('pwa.profiles.v1',raw);
+ const candidate=candidateRegistry(raw,['ciyan-mandarin','ciyan-mandarin-profile-recovered_1']);
+ assert.equal(candidate.profiles.length,2);assert(candidate.profiles.some(p=>p.id==='recovered_1'));
+ recoverRegistry(candidate,storage);
+ assert.equal(storage.getItem('pwa.profiles.v1.recovery-source'),raw);
+ assert.deepEqual(readRegistry(storage),candidate);
+});
+test('recovery handles an inconsistent but parseable legacy registry',()=>{
+ const raw=JSON.stringify({version:1,active:'missing',legacyId:'legacy',profiles:[{id:'legacy',name:'Original'},{id:'profile2',name:'Study'}]});
+ const candidate=candidateRegistry(raw,['ciyan-mandarin','ciyan-mandarin-profile-profile2']);
+ assert.equal(candidate.active,'legacy');assert.equal(candidate.profiles.length,2);
+});

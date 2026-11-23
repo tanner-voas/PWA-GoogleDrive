@@ -55,3 +55,36 @@ test('Worker commits using one object listing rather than per-section Drive requ
  assert.equal(stored.filter(item=>item===null).length,0);
  assert.equal(stored.filter(item=>item===undefined).length,1); // One list for all object names
 });
+
+test('retry after interrupted head update resumes immutable revision without duplicating it',async()=>{
+ const data=await splitBackup(sample()),files=new Map(),writes=[],known=new Set(Object.values(data.sections).map(h=>`${h}.json`));
+ const ctx={storage:{get:async()=>Date.now(),put:async()=>{}},waitUntil(){}},coord=new AccountCoordinator(ctx,{});
+ coord.folders=async()=>({objects:'objects'});coord.appFolder=async()=> 'app';
+ coord.head=async()=>({folder:'app',head:files.has('head.json')?JSON.parse(files.get('head.json')):null,file:files.has('head.json')?{id:'head.json'}:null});
+ coord.list=async(folder,name)=>folder==='objects'?[...known].map(x=>({name:x})):name&&files.has(name)?[{name,id:name}]:[];
+ coord.content=async id=>files.get(id);
+ let failHead=true;
+ coord.createJSON=async(_folder,name,content)=>{
+  writes.push(name);
+  if(name==='head.json'&&failHead){failHead=false;throw Error('Drive API 503');}
+  files.set(name,content);return {id:name};
+ };
+ coord.replaceJSON=async(id,content)=>{files.set(id,content);};
+ const revision={format:1,id:'revision-one',operationId:'operation-one',parent:null,sections:data.sections,meta:data.meta,at:new Date().toISOString()};
+ const commit=()=>coord.route({method:'POST',path:'/profiles/profile/apps/ciyan/commit',body:JSON.stringify({expected:null,revision})});
+ await assert.rejects(commit(),/503/);
+ assert(files.has('r_revision-one.json'));
+ const retry={...revision,at:new Date(Date.now()+40000).toISOString()};
+ const recovered=await coord.route({method:'POST',path:'/profiles/profile/apps/ciyan/commit',body:JSON.stringify({expected:null,revision:retry})});assert.equal(recovered.status,200);
+ assert.equal(writes.filter(x=>x==='r_revision-one.json').length,1);
+ assert.equal(JSON.parse(files.get('head.json')).id,'revision-one');
+});
+
+test('portable reader content is independently chunked and reconstructs on a cold device',async()=>{
+ const chapter='{"novel":"custom-book","number":1,"paragraphs":[]}',digest='f'.repeat(64);
+ const backup={format:'ciyan-backup',version:2,appVersion:'0.9.11',state:{readerContent:{[digest]:chapter},cards:[{id:'word'}],settings:{cloudIncludeCustomText:true}}};
+ const split=await splitBackup(backup),entries=Object.fromEntries(Object.entries(split.sections).map(([key,h])=>[key,JSON.parse(split.payloads[h])]));
+ assert(split.meta.layout.readerContent.type==='reader-text');
+ assert.deepEqual(Object.keys(split.sections).filter(k=>k.startsWith('readerText_')).length,1);
+ assert.deepEqual((await import('../src/sync.js')).reconstructBackup({meta:split.meta},entries).state,backup.state);
+});
