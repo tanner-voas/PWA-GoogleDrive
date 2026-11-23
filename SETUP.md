@@ -1,4 +1,4 @@
-# Full installation and setup — PWA-GoogleDrive v0.1.0
+# Full installation and setup — PWA-GoogleDrive v0.1.1
 
 **Baseline:** AppLauncher v0.1.6 → v0.1.7 and Ciyan v0.9.6 (Unified Header release) → v0.9.7. This does **not** apply on top of the deferred Ciyan v0.9.6 Google Drive prototype. The original Google Drive branch remains separate.
 
@@ -25,13 +25,13 @@ The connected GitHub interface currently does **not** permit creating repositori
 - Prefer private if you do not want the implementation visible; ensure GitHub Actions/submodule clones have permission if private. Public is simpler for the existing unauthenticated submodule checkout workflows.
 - Initialize with **no** README, `.gitignore`, or license (the downloaded bundle already has Git history and these files).
 
-Extract the supplied `PWA-GoogleDrive_v0.1.0.zip` into your iSH working folder, e.g. `/mnt/wcopy/apps/PWA-GoogleDrive`, preserving the `.git` directory.
+For a fresh installation, extract the original `PWA-GoogleDrive_v0.1.0.zip` into your iSH working folder, e.g. `/mnt/wcopy/apps/PWA-GoogleDrive`, preserving the `.git` directory, then apply the v0.1.1 patch with `git am` (or your `gamp` alias). Existing v0.1.0 checkouts only need the patch.
 
 ```sh
 cd /mnt/wcopy/apps/PWA-GoogleDrive
 git status -sb
 git remote -v
-# Push only after configuring the CIYAN_DISPATCH_TOKEN secret (section 2).
+# Push only after configuring the DISPATCH_TOKEN secret (section 2).
 git push -u origin main
 ```
 
@@ -41,7 +41,7 @@ git push -u origin main
 
 Create a fine-grained Personal Access Token via GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens. Restrict it to `tanner-voas/Ciyan`, set **Contents: Read and write** (used for repository dispatch). Give it a short descriptive name and a sensible expiration. Store it in the new PWA-GoogleDrive GitHub repository → Settings → Secrets and variables → Actions → New repository secret:
 
-- `CIYAN_DISPATCH_TOKEN` — GitHub token with Ciyan Contents write.
+- `DISPATCH_TOKEN` — GitHub token with Ciyan Contents write.
 
 Ciyan already uses `APP_LAUNCHER_DISPATCH_TOKEN` for ordinary Ciyan → AppLauncher notifications. Verify this secret is present in **Ciyan** repository Actions secrets. If not, create another fine-grained GitHub token restricted to **AppLauncher** with Contents Read and write, and store it under that name in Ciyan.
 
@@ -158,7 +158,7 @@ Deploy or let your existing GitHub → Cloudflare Worker builds deploy each app 
 - **Google sign-in expires after one week:** External OAuth consent screen is probably still in Testing status.
 - **503 profile binding missing:** The `pwa-profiles-api` Worker is not deployed in the same Cloudflare account or the app's service binding is missing.
 - **403 origin not configured:** Add both live origins to ALLOWED_ORIGINS in the shared Worker's `wrangler.jsonc`, redeploy.
-- **CI action fails with authentication:** Check `CIYAN_DISPATCH_TOKEN`, `APP_LAUNCHER_DISPATCH_TOKEN`, Actions workflow permissions, branch protection.
+- **CI action fails with authentication:** Check `DISPATCH_TOKEN`, `APP_LAUNCHER_DISPATCH_TOKEN`, Actions workflow permissions, branch protection.
 - **AppLauncher action runs twice:** Normal dispatch notifications can overlap. Concurrency and idempotent checks should yield at most one effective update. Do not add an extra independent updater.
 - **Google Drive outage / weak mobile connectivity:** Do not create a new profile; leave Ciyan open offline. Pending unsynced data stays local and is retried when the app runs again.
 - **Unknown local/cloud lineage:** The client refuses a destructive guess. Preserve a JSON export and deliberately select/upload the intended source; a transient error must never automatically fork.

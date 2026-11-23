@@ -19,12 +19,12 @@ jobs:
       - run: npm test && npm run check
       - name: Notify Ciyan dependency update
         env:
-          TOKEN: ${{ secrets.CIYAN_DISPATCH_TOKEN }}
+          TOKEN: ${{ secrets.DISPATCH_TOKEN }}
           SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ -z "$TOKEN" ]]; then echo '::error::Set CIYAN_DISPATCH_TOKEN in PWA-GoogleDrive'; exit 1; fi
+          if [[ -z "$TOKEN" ]]; then echo '::error::Set DISPATCH_TOKEN in PWA-GoogleDrive'; exit 1; fi
           jq -n --arg sha "$SHA" '{event_type:"google-drive-release",client_payload:{sha:$sha}}' > /tmp/dispatch.json
           curl --fail-with-body --silent --show-error --retry 3 -X POST \
             -H "Authorization: Bearer $TOKEN" -H 'Accept: application/vnd.github+json' \
