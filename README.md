@@ -44,3 +44,7 @@ Only one profile manager owns document click handlers at a time, even when
 AppLauncher and an embedded app import the shared UI from different module URLs.
 The controller exposes `destroy()` and `open('push')` for app lifecycle and
 archive integration. An app adapter owns its own profile-fork data copy.
+
+## v0.1.5 efficiency update
+
+Ciyan dictionary/grammar arrays and learning history remain independently hashed. New reader backups split stable book catalogs, per-chapter text metadata, reader cursors and chapter bookmarks into separate objects. Skill schedules are grouped into smaller per-mode, per-ID buckets. Legacy revision layouts remain downloadable. The scheduler's normal `now()` call is a no-op if already synchronized; `now({force:true})` explicitly verifies remote state for a user-requested Sync.

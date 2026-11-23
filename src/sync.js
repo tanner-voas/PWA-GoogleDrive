@@ -1,6 +1,5 @@
 import {api} from './profiles.js';
 /** Cloud snapshots are immutable JSON sections addressed by SHA-256. */
-const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 export const hex=bytes=>[...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
 export async function checksum(text){return hex(await crypto.subtle.digest('SHA-256',new TextEncoder().encode(text)));}
 const SESSION_KEY='pwa.sync.v1';
@@ -8,17 +7,52 @@ export function getSyncCursor(profileId,appId){try{return JSON.parse(localStorag
 export function setSyncCursor(profileId,appId,cursor){localStorage.setItem(`${SESSION_KEY}:${profileId}:${appId}`,JSON.stringify(cursor));}
 const CHUNK_SIZE=128;
 function keyHash(s){let n=2166136261;for(let i=0;i<s.length;i++){n^=s.charCodeAt(i);n=Math.imul(n,16777619);}return (n>>>0)%32;}
+// Preserve the existing array layout for dictionary and history data: those
+// hashes are already separate from settings/progress and remain reusable.
+// Reader chapters and nested skill schedules need more granular partitions.
+const SKILL_PARTS=16;
 export async function splitBackup(backup){
  if(!backup||!backup.state||typeof backup.state!=='object')throw Error('Cannot synchronize an incomplete backup');
  const sections={},payloads={},layout={};
  const add=async(key,data)=>{const content=JSON.stringify(data===undefined?null:data),hash=await checksum(content);sections[key]=hash;payloads[hash]=content;};
  for(const [key,data] of Object.entries(backup.state)){
   if(!/^[a-zA-Z0-9_-]{1,55}$/.test(key))throw Error('Invalid backup section');
-  if(Array.isArray(data)&&data.length>CHUNK_SIZE){
+  if(key==='reader'&&data&&typeof data==='object'&&!Array.isArray(data)){
+   const books=[];
+   for(const [id,book] of Object.entries(data)){
+    if(['__proto__','constructor','prototype'].includes(id))throw Error('Invalid reader ID');
+    if(!book||typeof book!=='object'||!Array.isArray(book.chapters))throw Error('Invalid reader book in backup');
+    const token=(await checksum(id)).slice(0,24),prefix=`reader_${token}`;
+    if(books.some(item=>item.token===token))throw Error('Reader ID hash collision');
+    const {chapters,...header}=book;
+    // Keep large immutable dictionary/catalog data separate from the small
+    // reader cursor and per-chapter bookmark changes.
+    const fields=['current','progress','history'].filter(field=>Object.hasOwn(header,field));
+    for(const field of fields){await add(`${prefix}_state_${field}`,header[field]);delete header[field];}
+    await add(`${prefix}_meta`,header);
+    const positions=[];
+    for(let i=0;i<chapters.length;i++){
+     const {position,...chapter}=chapters[i];
+     await add(`${prefix}_${i}_content`,chapter);
+     const hasPosition=Object.hasOwn(chapters[i],'position');positions.push(hasPosition);
+     if(hasPosition)await add(`${prefix}_${i}_position`,position);
+    }
+    books.push({id,token,count:chapters.length,fields,positions});
+   }
+   layout[key]={type:'reader',books};
+  }else if(key==='skillSchedules'&&data&&typeof data==='object'&&!Array.isArray(data)){
+   const modes=Object.keys(data);
+   layout[key]={type:'mode-buckets',modes,parts:SKILL_PARTS};
+   for(const mode of modes){
+    if(!/^[a-zA-Z0-9-]{1,32}$/.test(mode))throw Error('Invalid skill mode');
+    const buckets=Array.from({length:SKILL_PARTS},()=>({}));
+    for(const [id,value] of Object.entries(data[mode]||{}))buckets[keyHash(id)%SKILL_PARTS][id]=value;
+    for(let i=0;i<SKILL_PARTS;i++)await add(`${key}_${mode}_${i}`,buckets[i]);
+   }
+  }else if(Array.isArray(data)&&data.length>CHUNK_SIZE){
    layout[key]={type:'array',count:data.length,parts:Math.ceil(data.length/CHUNK_SIZE)};
    for(let i=0;i<layout[key].parts;i++)await add(`${key}_${i}`,data.slice(i*CHUNK_SIZE,(i+1)*CHUNK_SIZE));
-  }else if(key==='schedules'||key==='skillSchedules'||key==='postponed'){
-   // Per-key deterministic buckets prevent unrelated schedule changes from reuploading.
+  }else if(key==='schedules'||key==='postponed'){
    const buckets=Array.from({length:32},()=>({}));
    for(const [k,v] of Object.entries(data||{}))buckets[keyHash(k)][k]=v;
    layout[key]={type:'buckets',parts:32};
@@ -37,6 +71,32 @@ export function reconstructBackup(revision,entries){
    if(parts.length!==spec.count)throw Error('Incomplete history partition');state[key]=parts;
   }else if(spec.type==='buckets'){
    const parts={};for(let i=0;i<spec.parts;i++){const chunk=entries[`${key}_${i}`];if(!chunk||Array.isArray(chunk))throw Error('Missing dictionary partition');Object.assign(parts,chunk);}state[key]=parts;
+  }else if(spec.type==='mode-buckets'){
+   const modes={};
+   for(const mode of spec.modes){const part={};for(let i=0;i<spec.parts;i++){
+    const chunk=entries[`${key}_${mode}_${i}`];if(!chunk||Array.isArray(chunk))throw Error('Missing skill schedule partition');Object.assign(part,chunk);
+   }modes[mode]=part;}state[key]=modes;
+  }else if(spec.type==='reader'){
+   const books={};
+   for(const {id,token,count,fields=[],positions=[]} of spec.books){
+    const header=entries[`reader_${token}_meta`];
+    if(!header||typeof header!=='object'||Array.isArray(header))throw Error('Missing reader metadata');
+    const chapters=[];
+    for(let i=0;i<count;i++){
+     const part=entries[`reader_${token}_${i}_content`];if(!part||typeof part!=='object'||Array.isArray(part))throw Error('Missing reader chapter');
+     const hasPosition=positions[i];
+     const position=entries[`reader_${token}_${i}_position`];
+     if(hasPosition&&!Object.hasOwn(entries,`reader_${token}_${i}_position`))throw Error('Missing reader bookmark');
+     chapters.push(hasPosition?{...part,position}:part);
+    }
+    const updated={...header};
+    for(const field of fields){
+     if(!Object.hasOwn(entries,`reader_${token}_state_${field}`))throw Error('Missing reader state');
+     updated[field]=entries[`reader_${token}_state_${field}`];
+    }
+    books[id]={...updated,chapters};
+   }
+   state[key]=books;
   }else throw Error('Unsupported backup partition');
  }
  return {format:revision.meta.format,version:revision.meta.version,appVersion:revision.meta.appVersion,state};
@@ -106,9 +166,9 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
    }
    cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null};
    persist();failures=0;
-   if(result.stale){dirty=true;publish('pending');}
+   if(result.stale||dirty){dirty=true;publish('pending');}
    else publish('synced',{revision:input.revision});
-   return {status:result.stale?'pending':result.status,head:result.head};
+   return {status:dirty?'pending':result.status,head:result.head};
   }catch(error){dirty=true;failures++;publish('error',{error});throw error;}
   finally{if(dirty&&!stopped)schedule(failures?Math.min(60000,2000*2**Math.min(failures,5)):4000);}
  }
@@ -128,10 +188,13 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
   schedule();if(!maxTimer)maxTimer=setTimeout(()=>{void flush().catch(()=>{});},60000);
   publish('pending');
  }
- async function now(){
+ async function now({force=false}={}){
   if(stopped)throw Error('Synchronization is stopped');
   if(running){await running;}
-  if(!dirty)dirty=true; // Explicit sync verifies unchanged content as well.
+  // Home/Refresh must not issue a network request when local data is already
+  // confirmed. The manual Sync button may still explicitly check the head.
+  if(!dirty&&!force)return {status:'unchanged',head:cursor.head};
+  if(force&&!dirty)dirty=true;
   const result=await flush();
   if(result.status==='conflict')throw Error('A different cloud revision was found; local data was preserved');
   if(result.status==='pending')return now(); // Retry a newer local revision after a lost response.
