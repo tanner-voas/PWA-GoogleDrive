@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.3
+# PWA-GoogleDrive v0.1.4
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
@@ -37,3 +37,10 @@ See `SETUP.md` for full creation/deployment and the per-repo `gamp` order. Both 
 ## v0.1.3 upload reliability
 
 The first-upload revision comparison now treats a missing head as `null` on both sides (v0.1.2 incorrectly treated it as divergence). Sections are batched in bounded requests; the Worker validates content hashes and confirms the entire object set with a single listing before committing the head. Restoration verifies downloaded checksums in small batches. The sync scheduler exposes real upload results/errors and progress; network failures do not turn into profile forks.
+
+## v0.1.4 profile controller isolation
+
+Only one profile manager owns document click handlers at a time, even when
+AppLauncher and an embedded app import the shared UI from different module URLs.
+The controller exposes `destroy()` and `open('push')` for app lifecycle and
+archive integration. An app adapter owns its own profile-fork data copy.

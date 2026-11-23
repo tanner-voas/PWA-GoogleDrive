@@ -1,5 +1,4 @@
 import {currentProfile,getProfiles,upsertProfile,renameProfile,selectProfile,forkProfile,renameRemoteProfile,remoteProfiles,status,connect,disconnect,displayStatus} from './profiles.js';
-import {cloneCiyanData} from './local-data.js';
 /** Shared account identity UI; each host supplies app-specific data operations. */
 const ico='<svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 21c0-5 3.2-8 7.5-8s7.5 3 7.5 8"/></svg>';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -20,13 +19,27 @@ export const profileStyles=`
 @media(max-width:380px){.pwa-profile-button{width:40px;height:40px;border-radius:12px}.pwa-profile-panel{padding:16px}}
 `;
 const NAME_MAX=64;
+// Both AppLauncher and hosted apps import distinct URLs for this module. A
+// document-level singleton prevents them from keeping competing click handlers.
+const PROFILE_CONTROLLER=Symbol.for('pwa.profile.manager.controller');
 export function installProfileUI({adapter={}}={}){
+ document[PROFILE_CONTROLLER]?.destroy();
+ const listeners=new AbortController();
  if(!document.getElementById('pwa-profile-style')){const style=document.createElement('style');style.id='pwa-profile-style';style.textContent=profileStyles;document.head.append(style);}
- let overlay=null,busy=false,remote=[],connection='checking',account='',error='',screen='main',operation='';
+ let overlay=null,busy=false,remote=[],connection='checking',account='',error='',screen='main',operation='',destroyed=false;
  const connected=()=>connection==='connected';
- async function refreshCloud(){connection='checking';draw();try{const s=await status();connection=s.connected?'connected':'disconnected';account=s.email||'';remote=connected()?(await remoteProfiles()).profiles:[];}
- catch(e){connection='failed';remote=[];error=`Cannot check Google Drive: ${displayStatus(e)}`;}draw();}
+ async function refreshCloud(){
+  if(destroyed)return;
+  connection='checking';draw();
+  try{const s=await status();if(destroyed)return;connection=s.connected?'connected':'disconnected';account=s.email||'';remote=connected()?(await remoteProfiles()).profiles:[];}
+  catch(e){if(destroyed)return;connection='failed';remote=[];error=`Cannot check Google Drive: ${displayStatus(e)}`;}
+  if(!destroyed)draw();
+ }
  function close(){overlay?.remove();overlay=null;document.body.style.removeProperty('overflow');}
+ function destroy(){
+  if(destroyed)return;destroyed=true;listeners.abort();close();
+  if(document[PROFILE_CONTROLLER]===controller)delete document[PROFILE_CONTROLLER];
+ }
  const row=(action,label,{disabled=busy,detail='',id=''}={})=>`<button type="button" class="pwa-profile-row" data-pwa="${action}" ${id?`data-id="${esc(id)}"`:''} ${disabled?'disabled':''}>${esc(label)}${detail?`<div class="pwa-profile-muted">${esc(detail)}</div>`:''}</button>`;
  function draw(){if(!overlay)return;const p=currentProfile(),local=getProfiles();const body=overlay.querySelector('.pwa-profile-panel');if(!body)return;
   const title=screen==='switch'?'Switch profile':screen==='rename'?'Rename profile':screen==='push'?'Overwrite cloud profile':'Profile';
@@ -63,7 +76,15 @@ export function installProfileUI({adapter={}}={}){
   try{await fn();}catch(e){error=displayStatus(e);}
   finally{busy=false;operation='';draw();}
  }
- async function open(){if(overlay){close();return;}overlay=document.createElement('div');overlay.className='pwa-overlay';overlay.innerHTML='<section class="pwa-profile-panel" role="dialog" aria-modal="true" aria-label="Profile manager"></section>';overlay.addEventListener('click',e=>{if(e.target===overlay&&!busy)close();});document.body.append(overlay);document.body.style.overflow='hidden';error='';screen='main';draw();await refreshCloud();}
+ async function open(initialAction=null){
+  if(destroyed)return;
+  if(overlay){if(initialAction==='push'){await perform('push');return;}close();return;}
+  overlay=document.createElement('div');overlay.className='pwa-overlay';overlay.innerHTML='<section class="pwa-profile-panel" role="dialog" aria-modal="true" aria-label="Profile manager"></section>';
+  overlay.addEventListener('click',e=>{if(e.target===overlay&&!busy)close();});
+  document.body.append(overlay);document.body.style.overflow='hidden';error='';screen='main';draw();
+  await refreshCloud();
+  if(!destroyed&&initialAction==='push'&&connected())await perform('push');
+ }
  async function push(targetId=null){return safe(async()=>{
   if(!adapter.onPush)throw Error('Open Ciyan to upload this profile');
   const p=currentProfile();const result=await adapter.onPush({targetId,name:p.name});
@@ -90,7 +111,7 @@ export function installProfileUI({adapter={}}={}){
   if(action==='fork')return safe(async()=>{
    const source=currentProfile(),name=prompt('Name for local copy',`${source.name} (copy)`)?.trim().slice(0,NAME_MAX);if(!name)return;
    await adapter.beforeSwitch?.();const id=forkProfile(source.id,name);
-   try{await cloneCiyanData(source.id,id);}catch(e){throw Error('Cannot clone local profile: '+e.message);}
+   try{await adapter.onFork?.({sourceId:source.id,id,name});}catch(e){throw Error('Cannot clone local profile: '+e.message);}
    selectProfile(id);close();location.reload();
   },'Copying complete profile…');
   if(action==='switch'&&id)return safe(async()=>{
@@ -115,10 +136,12 @@ export function installProfileUI({adapter={}}={}){
  }
  document.addEventListener('click',e=>{const trigger=e.target.closest?.('[data-pwa-profile-button]');if(trigger){e.preventDefault();void open();return;}
   const action=e.target.closest?.('[data-pwa]');if(action&&overlay?.contains(action)){e.preventDefault();void perform(action.dataset.pwa,action.dataset.id);}
- });
- document.addEventListener('submit',e=>{if(overlay?.contains(e.target)&&e.target.id==='pwa-profile-form'){e.preventDefault();void submit(e.target);}});
- document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!busy)close();});
- window.addEventListener('ciyan-cloud-status',()=>{if(overlay)draw();});
- if(sessionStorage.getItem('pwa:connect-pending')){sessionStorage.removeItem('pwa:connect-pending');setTimeout(()=>{void open();},100);}
- return {open,refreshCloud,close};
+ },{signal:listeners.signal});
+ document.addEventListener('submit',e=>{if(overlay?.contains(e.target)&&e.target.id==='pwa-profile-form'){e.preventDefault();void submit(e.target);}},{signal:listeners.signal});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!busy)close();},{signal:listeners.signal});
+ window.addEventListener('ciyan-cloud-status',()=>{if(overlay)draw();},{signal:listeners.signal});
+ if(sessionStorage.getItem('pwa:connect-pending')){sessionStorage.removeItem('pwa:connect-pending');setTimeout(()=>{if(!destroyed)void open();},100);}
+ const controller={open,refreshCloud,close,destroy};
+ document[PROFILE_CONTROLLER]=controller;
+ return controller;
 }
