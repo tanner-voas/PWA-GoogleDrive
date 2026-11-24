@@ -1,4 +1,4 @@
-import {currentProfile,getProfiles,upsertProfile,renameProfile,selectProfile,forkProfile,renameRemoteProfile,remoteProfiles,status,connect,disconnect,displayStatus} from './profiles.js';
+import {currentProfile,getProfiles,upsertProfile,renameProfile,selectProfile,forkProfile,renameRemoteProfile,remoteProfiles,status,connect,disconnect,revokeAuthorization,displayStatus} from './profiles.js';
 /** Shared account identity UI; each host supplies app-specific data operations. */
 const ico='<svg viewBox="0 0 24 24" width="23" height="23" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 21c0-5 3.2-8 7.5-8s7.5 3 7.5 8"/></svg>';
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -63,7 +63,8 @@ export function installProfileUI({adapter={}}={}){
    if(connected()){
     if(!p.remote&&adapter.onPush)inner+=row('push','Push profile',{detail:'Create and verify the complete Google Drive backup'});
     if(p.remote&&adapter.onSync)inner+=row('sync','Sync now',{detail:'Upload any pending Ciyan changes'});
-    inner+=row('disconnect','Disconnect Google Drive');
+    inner+=row('disconnect','Sign out on this device',{detail:'Keep Google authorization and all saved backups'});
+    inner+=row('revoke','Revoke Google Drive access',{detail:'Disconnect all devices and remove stored authorization; keep backups'});
    }else if(connection!=='checking')inner+=row('connect','Connect Google Drive');
    if(connection==='failed')inner+=row('retry','Retry connection check');
    inner+='<p class="pwa-profile-muted">Changes are always saved locally first. Only a verified cloud revision is considered backed up.</p>';
@@ -107,7 +108,11 @@ export function installProfileUI({adapter={}}={}){
    if(collision){screen='push';return draw();}return push();
   }
   if(action==='sync')return safe(async()=>{await adapter.onSync?.();},'Synchronizing and verifying…');
-  if(action==='disconnect')return safe(async()=>{await adapter.beforeDisconnect?.();await disconnect();connection='disconnected';remote=[];await adapter.onDisconnected?.();},'Disconnecting…');
+  if(action==='disconnect')return safe(async()=>{await adapter.beforeDisconnect?.();await disconnect();connection='disconnected';remote=[];account='';await adapter.onDisconnected?.();},'Signing out…');
+  if(action==='revoke'){
+   if(prompt('Revoke Google Drive access for this account on ALL devices? Local data and Drive backup files remain. Type REVOKE to confirm.')!=='REVOKE')return;
+   return safe(async()=>{await adapter.beforeDisconnect?.();const result=await revokeAuthorization();if(!result?.disconnected||!result.storedAuthorizationRemoved)throw Error('Revocation was not confirmed');connection='disconnected';remote=[];account='';await adapter.onDisconnected?.();if(!result.revoked)error='Stored authorization was removed and all sessions disconnected, but Google did not confirm grant revocation. Check Google Account → Third-party connections.';},'Revoking account authorization…');
+  }
   if(action==='fork')return safe(async()=>{
    const source=currentProfile(),name=prompt('Name for local copy',`${source.name} (copy)`)?.trim().slice(0,NAME_MAX);if(!name)return;
    await adapter.beforeSwitch?.();const id=forkProfile(source.id,name);

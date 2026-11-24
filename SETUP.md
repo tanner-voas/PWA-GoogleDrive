@@ -155,7 +155,7 @@ Deploy or let your existing GitHub → Cloudflare Worker builds deploy each app 
 5. In Google Drive, check the visible profile folder and content-addressed object files. Do not manually edit `head.json` or chunk files.
 6. Review one study word. The answer should save immediately to IndexedDB. After a short debounce the backup indicator should move from red to yellow while uploading, then green upon confirmed success. If upload fails, the local data must remain intact.
 7. Fork the current profile, name it `Test Fork`, switch and confirm it starts with identical learning history and dictionary; then change one setting and verify the original profile is unchanged.
-8. Disconnect Google Drive. Changes should still save locally. Reconnect, select that profile again, and verify it uploads changed sections.
+8. Sign out on this device. Changes should still save locally. Reconnect, select that profile again, and verify it uploads changed sections.
 9. Test restoring a prior version only after exporting a separate JSON backup. Restoring should create a safety fork, reload the selected full state, and sync it as a new revision. PIN-encrypted speech credentials should require the existing PIN to unlock.
 10. Test standalone Ciyan independently: its browser session may need another Google sign-in due to the different hostname. Choose the same cloud profile; it should download that profile's Ciyan data instead of creating an empty one.
 

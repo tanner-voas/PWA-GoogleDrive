@@ -2,7 +2,7 @@ import {retainedIds,checkRevision} from '../src/retention.js';
 const PREFIX='/_profiles/v1',ROOT='AppLauncher Profiles',DRIVE='https://www.googleapis.com/drive/v3/files',UPLOAD='https://www.googleapis.com/upload/drive/v3/files';
 const ID=/^[A-Za-z0-9_-]{1,80}$/,SHA=/^[a-f0-9]{64}$/,FOLDER='application/vnd.google-apps.folder';
 const enc=new TextEncoder(),dec=new TextDecoder();
-const json=(object,status=200,extra={})=>new Response(JSON.stringify(object),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store',...extra}});
+const json=(object,status=200,extra={})=>new Response(JSON.stringify(object),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',...extra}});
 const error=(status,message,extra={})=>json({error:message,...extra},status);
 const rand=()=>crypto.randomUUID();
 const b64=bytes=>btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -10,8 +10,15 @@ const rawb64=str=>Uint8Array.from(atob(str.replace(/-/g,'+').replace(/_/g,'/')+'
 const hex=buf=>Array.from(new Uint8Array(buf),b=>b.toString(16).padStart(2,'0')).join('');
 async function hmac(payload,secret){const key=await crypto.subtle.importKey('raw',enc.encode(secret),{name:'HMAC',hash:'SHA-256'},false,['sign']);return b64(await crypto.subtle.sign('HMAC',key,enc.encode(payload)));}
 async function sign(data,env){const body=b64(enc.encode(JSON.stringify(data)));return `${body}.${await hmac(body,env.SESSION_SIGNING_KEY)}`;}
-async function unsign(cookie,env){if(!cookie||!cookie.includes('.'))return null;const [payload,signature]=cookie.split('.');if(!payload||!signature||await hmac(payload,env.SESSION_SIGNING_KEY)!==signature)return null;
- try{const data=JSON.parse(dec.decode(rawb64(payload)));return data.exp>Date.now()?data:null;}catch{return null;}}
+async function unsign(cookie,env){
+ try{
+  if(typeof cookie!=='string'||cookie.length>4096)return null;
+  const parts=cookie.split('.');if(parts.length!==2||parts.some(p=>!p||!/^[A-Za-z0-9_-]+$/.test(p)))return null;
+  const [payload,signature]=parts,key=await crypto.subtle.importKey('raw',enc.encode(env.SESSION_SIGNING_KEY),{name:'HMAC',hash:'SHA-256'},false,['verify']);
+  if(!await crypto.subtle.verify('HMAC',key,rawb64(signature),enc.encode(payload)))return null;
+  const data=JSON.parse(dec.decode(rawb64(payload)));return Number.isFinite(data.exp)&&data.exp>Date.now()?data:null;
+ }catch{return null;}
+}
 const cookies=request=>Object.fromEntries((request.headers.get('Cookie')||'').split(';').map(s=>s.trim().split(/=(.*)/s).slice(0,2)).filter(x=>x[0]));
 const cookie=(name,value,age)=>`${name}=${value}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=${age}`;
 const SESSION='__Host-pwa_profile_session',OAUTH='__Host-pwa_oauth_state';
@@ -22,24 +29,24 @@ async function googleToken(env,body){const res=await fetch('https://oauth2.googl
 const internal=(stub,path,body)=>stub.fetch(new Request(`https://internal${path}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}));
 async function oauthStart(request,env,url){
  const desired=url.searchParams.get('return')||'/';const returnTo=desired.startsWith('/')&&!desired.startsWith('//')&&!desired.includes('\\')?desired:'/';
- const state=rand(),expires=Date.now()+600000,redirect=`${url.origin}${PREFIX}/auth/callback`;
- const value=await sign({state,returnTo,exp:expires},env);
- const auth=new URL('https://accounts.google.com/o/oauth2/v2/auth');auth.searchParams.set('client_id',env.GOOGLE_CLIENT_ID);auth.searchParams.set('redirect_uri',redirect);auth.searchParams.set('response_type','code');auth.searchParams.set('scope','openid email https://www.googleapis.com/auth/drive.file');auth.searchParams.set('access_type','offline');auth.searchParams.set('prompt','consent');auth.searchParams.set('state',state);
- return new Response(null,{status:302,headers:{Location:auth.toString(),'Set-Cookie':cookie(OAUTH,value,600),'Cache-Control':'no-store'}});
+ const state=rand(),verifier=b64(crypto.getRandomValues(new Uint8Array(32))),expires=Date.now()+600000,redirect=`${url.origin}${PREFIX}/auth/callback`;
+ const value=await sign({state,verifier,returnTo,exp:expires},env);
+ const auth=new URL('https://accounts.google.com/o/oauth2/v2/auth');auth.searchParams.set('client_id',env.GOOGLE_CLIENT_ID);auth.searchParams.set('redirect_uri',redirect);auth.searchParams.set('response_type','code');auth.searchParams.set('scope','openid email https://www.googleapis.com/auth/drive.file');auth.searchParams.set('access_type','offline');auth.searchParams.set('prompt','consent');auth.searchParams.set('state',state);auth.searchParams.set('code_challenge',b64(await crypto.subtle.digest('SHA-256',enc.encode(verifier))));auth.searchParams.set('code_challenge_method','S256');
+ return new Response(null,{status:302,headers:{Location:auth.toString(),'Set-Cookie':cookie(OAUTH,value,600),'Cache-Control':'no-store','Referrer-Policy':'no-referrer'}});
 }
 async function oauthCallback(request,env,url){
  const state=await unsign(cookies(request)[OAUTH],env),queryState=url.searchParams.get('state');
- if(!state||!queryState||queryState!==state.state)return error(400,'Invalid or expired Google sign-in state. Start again.');
+ if(!state||typeof state.verifier!=='string'||!queryState||queryState!==state.state)return error(400,'Invalid or expired Google sign-in state. Start again.');
  if(url.searchParams.has('error'))return error(400,'Google sign-in was cancelled or denied.');
  const code=url.searchParams.get('code');if(!code)return error(400,'Missing authorization code');
- const tokens=await googleToken(env,{client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,code,grant_type:'authorization_code',redirect_uri:`${url.origin}${PREFIX}/auth/callback`});
+ const tokens=await googleToken(env,{client_id:env.GOOGLE_CLIENT_ID,client_secret:env.GOOGLE_CLIENT_SECRET,code,code_verifier:state.verifier,grant_type:'authorization_code',redirect_uri:`${url.origin}${PREFIX}/auth/callback`});
  const userRes=await fetch('https://openidconnect.googleapis.com/v1/userinfo',{headers:{Authorization:`Bearer ${tokens.access_token}`}});
  if(!userRes.ok)throw Error('Cannot verify Google account');const user=await userRes.json();if(!/^\d+$/.test(String(user.sub)))throw Error('Invalid Google account identifier');
  const sid=rand(),exp=Date.now()+14*86400000,stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(String(user.sub)));
  const init=await internal(stub,'/login',{sid,exp,email:user.email||'',refresh:tokens.refresh_token?await encrypt(tokens.refresh_token,env):null});
  if(!init.ok){const result=await init.json();throw Error(result.error||'Google account could not be connected');}
  const session=await sign({sub:String(user.sub),sid,exp},env);
- return new Response(null,{status:302,headers:{Location:`${url.origin}${state.returnTo}`,'Set-Cookie':cookie(SESSION,session,14*86400),'Cache-Control':'no-store'}});
+ const headers=new Headers({Location:`${url.origin}${state.returnTo}`,'Cache-Control':'no-store','Referrer-Policy':'no-referrer'});headers.append('Set-Cookie',cookie(SESSION,session,14*86400));headers.append('Set-Cookie',cookie(OAUTH,'',0));return new Response(null,{status:302,headers});
 }
 export default {async fetch(request,env){
  try{
@@ -49,11 +56,14 @@ export default {async fetch(request,env){
   if(path==='/auth/start'&&request.method==='GET')return oauthStart(request,env,url);
   if(path==='/auth/callback'&&request.method==='GET')return oauthCallback(request,env,url);
   const session=await unsign(cookies(request)[SESSION],env);
-  if(!session)return path==='/status'?json({connected:false}):error(401,'Connect Google Drive to continue');
-  if(request.method!=='GET'&&request.headers.get('X-PWA-CSRF')!=='1')return error(403,'Missing CSRF guard');
+  if(!session||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return path==='/status'?json({connected:false}):error(401,'Connect Google Drive to continue');
+  if(request.method!=='GET'){
+   const origin=request.headers.get('Origin'),site=request.headers.get('Sec-Fetch-Site');
+   if(request.headers.get('X-PWA-CSRF')!=='1'||(origin&&origin!==url.origin)||site==='cross-site')return error(403,'Invalid request origin or CSRF guard');
+  }
   const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));
   const response=await internal(stub,'/api',{sid:session.sid,method:request.method,path,body:request.method==='GET'?null:await request.text()});
-  if(path==='/logout'&&response.ok){const headers=new Headers(response.headers);headers.append('Set-Cookie',cookie(SESSION,'',0));return new Response(response.body,{status:response.status,headers});}
+  if((path==='/logout'||path==='/revoke')&&response.ok){const headers=new Headers(response.headers);headers.append('Set-Cookie',cookie(SESSION,'',0));return new Response(response.body,{status:response.status,headers});}
   return response;
  }catch(e){return error(502,e.message==='Google OAuth token exchange failed'?e.message:'Cloud synchronization request failed');}
 }};
@@ -62,17 +72,58 @@ export class AccountCoordinator {
  constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.lastPrune=0;}
  async fetch(request){const url=new URL(request.url);let input;try{input=await request.json();}catch{return error(400,'Invalid request');}
   if(url.pathname==='/login'){
-   const run=async()=>{if(input.refresh)await this.ctx.storage.put('refresh',input.refresh);if(!(await this.ctx.storage.get('refresh')))return error(401,'Google did not issue offline authorization. Reconnect and consent again.');await this.ctx.storage.put(`session:${input.sid}`,{exp:input.exp,email:input.email});return json({ok:true});};
+   const run=async()=>{
+    if(input.refresh){await this.ctx.storage.put('refresh',input.refresh);this.access=null;}
+    if(!(await this.ctx.storage.get('refresh')))return error(401,'Google did not issue offline authorization. Reconnect and consent again.');
+    const epoch=await this.ctx.storage.get('authorizationEpoch')??null;
+    await this.ctx.storage.put(`session:${input.sid}`,{exp:input.exp,email:input.email,epoch});
+    try{await this.cleanSessions(epoch);}catch{} // best-effort cleanup; never block a valid login
+    return json({ok:true});
+   };
    return this.serial(run);
   }
   if(url.pathname!=='/api')return error(404,'Unknown account operation');
   const run=async()=>{try{
-   const session=await this.ctx.storage.get(`session:${input.sid}`);if(!session||session.exp<Date.now())return error(401,'Session expired; reconnect Google Drive');
+   const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
+   if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch){if(session)await this.ctx.storage.delete(`session:${input.sid}`);return input.path==='/status'?json({connected:false}):error(401,'Session expired or revoked; reconnect Google Drive');}
    if(input.path==='/logout'&&input.method==='POST'){await this.ctx.storage.delete(`session:${input.sid}`);return json({disconnected:true});}
+   if(input.path==='/revoke'&&input.method==='POST')return await this.revokeAuthorization(input);
    if(input.path==='/status'&&input.method==='GET')return json({connected:true,email:session.email});
    return await this.route(input);
   }catch(e){const msg=String(e.message||e);if(msg.startsWith('Google authorization expired'))return error(401,msg);if(msg.startsWith('Conflict:'))return error(409,msg.slice(9));const code=/Drive API (403|404|429|5\d\d)/.exec(msg)?.[1];return error(502,code?`Google Drive returned HTTP ${code}; local data is safe. Retry or check Cloudflare logs.`:'Google Drive operation failed. Local data is safe; retry later.',{stage:input.path});}};
   return this.serial(run);
+ }
+ // No Drive files are removed. The account epoch makes every prior session unusable,
+ // even if deleting an individual expired session fails. Serialize with other account work.
+ async revokeAuthorization(input){
+  let body;try{body=JSON.parse(input.body||'{}');}catch{return error(400,'Invalid revocation confirmation');}
+  if(body.confirm!=='REVOKE')return error(400,'Explicit account revocation confirmation required');
+  const encrypted=await this.ctx.storage.get('refresh');
+  if(!encrypted)return error(409,'Stored authorization is missing; remove access in Google Account settings and reconnect if needed.');
+  const token=await decrypt(encrypted,this.env);
+  let response;
+  try{response=await fetch('https://oauth2.googleapis.com/revoke',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams({token})});}
+  catch{return error(502,'Google revocation could not be confirmed. No local authorization was removed; retry.');}
+  const googleRevocationConfirmed=response.ok;
+  if(!googleRevocationConfirmed){
+   const detail=await response.json().catch(()=>({}));
+   // A rejected token is not proof the whole Google grant has been revoked.
+   // Remove the unusable local authority, but report the distinction explicitly.
+   if(response.status!==400||detail.error!=='invalid_token')return error(502,'Google revocation could not be confirmed. Retry or remove access in Google Account settings.');
+  }
+  const epoch=rand();this.access=null;
+  await this.ctx.storage.transaction(async tx=>{await tx.put('authorizationEpoch',epoch);await tx.delete('refresh');});
+  try{await this.cleanSessions(epoch);}catch{} // old sessions are already invalidated
+  return json({revoked:googleRevocationConfirmed,disconnected:true,storedAuthorizationRemoved:true});
+ }
+ async cleanSessions(epoch){
+  let startAfter;
+  do{
+   const entries=await this.ctx.storage.list({prefix:'session:',limit:128,...(startAfter?{startAfter}:{})});
+   const expired=[];for(const [key,session] of entries){startAfter=key;if(session.exp<=Date.now()||(session.epoch??null)!==epoch)expired.push(key);}
+   if(expired.length)await this.ctx.storage.delete(expired);
+   if(entries.size<128)break;
+  }while(startAfter);
  }
  serial(fn){const next=this.queue.then(fn,fn);this.queue=next.then(()=>{},()=>{});return next;}
  async token(){if(this.access?.exp>Date.now()+60000)return this.access.value;

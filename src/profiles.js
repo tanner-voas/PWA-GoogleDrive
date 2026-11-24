@@ -78,6 +78,7 @@ export function connect(returnTo=globalThis.location?.pathname||'/'){
  const url=new URL(`${cloudEndpoint}/auth/start`,globalThis.location.href);url.searchParams.set('return',returnTo.startsWith('/')&&!returnTo.startsWith('//')?returnTo:'/');globalThis.location.assign(url.href);
 }
 export const disconnect=()=>api('/logout',{method:'POST',body:'{}'});
+export const revokeAuthorization=()=>api('/revoke',{method:'POST',body:JSON.stringify({confirm:'REVOKE'})});
 export const createRemoteProfile=(id,name)=>api('/profiles',{method:'POST',body:JSON.stringify({id,name})});
 export const renameRemoteProfile=(id,name)=>api(`/profiles/${encodeURIComponent(id)}`,{method:'PATCH',body:JSON.stringify({name})});
 export function displayStatus(e){if(e?.status===401)return 'Google connection expired. Reconnect to resume syncing.';if(e?.status===409)return 'A different cloud revision was found.';return e?.message||'Synchronization error';}
