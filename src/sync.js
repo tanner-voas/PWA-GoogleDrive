@@ -11,12 +11,25 @@ function keyHash(s){let n=2166136261;for(let i=0;i<s.length;i++){n^=s.charCodeAt
 // hashes are already separate from settings/progress and remain reusable.
 // Reader chapters and nested skill schedules need more granular partitions.
 const SKILL_PARTS=16;
-export async function splitBackup(backup){
+// A cache belongs to one scheduler/profile. Only explicitly immutable fields
+// may reuse serialization by identity; mutable fields compare actual JSON.
+export const createBackupCache=({immutableFields=[]}={})=>({immutableFields:new Set(immutableFields),sections:new Map(),fields:new Map()});
+export async function splitBackup(backup,{cache}={}){
  if(!backup||!backup.state||typeof backup.state!=='object')throw Error('Cannot synchronize an incomplete backup');
- const sections={},payloads={},layout={};
- const add=async(key,data)=>{const content=JSON.stringify(data===undefined?null:data),hash=await checksum(content);sections[key]=hash;payloads[hash]=content;};
+ const sections={},payloads={},layout={},nextSections=new Map(),nextFields=new Map();
+ const stats={serialized:0,hashed:0,reusedHashes:0,identityReused:0};let fieldEntries=[],cachedChars=0;
+ const CACHE_CHARS=8*1024*1024; // bound retained serialized data (UTF-16 code units)
+ const record=(key,entry)=>{sections[key]=entry.hash;payloads[entry.hash]=entry.content;if(cache&&cachedChars+entry.content.length<=CACHE_CHARS){nextSections.set(key,entry);cachedChars+=entry.content.length;}fieldEntries.push([key,entry]);};
+ const add=async(key,data)=>{const content=JSON.stringify(data===undefined?null:data);stats.serialized++;
+  const old=cache?.sections.get(key);let entry;
+  if(old?.content===content){entry=old;stats.reusedHashes++;}else{entry={content,hash:await checksum(content)};stats.hashed++;}
+  record(key,entry);
+ };
  for(const [key,data] of Object.entries(backup.state)){
   if(!/^[a-zA-Z0-9_-]{1,55}$/.test(key))throw Error('Invalid backup section');
+  fieldEntries=[];
+  const immutable=cache?.immutableFields.has(key)&&Array.isArray(data),prior=immutable?cache.fields.get(key):null;
+  if(prior?.value===data){layout[key]=prior.layout;for(const [name,entry] of prior.entries){record(name,entry);stats.identityReused++;stats.reusedHashes++;}if(prior.entries.every(([name])=>nextSections.has(name)))nextFields.set(key,prior);continue;}
   if(key==='reader'&&data&&typeof data==='object'&&!Array.isArray(data)){
    const books=[];
    for(const [id,book] of Object.entries(data)){
@@ -66,8 +79,10 @@ export async function splitBackup(backup){
    layout[key]={type:'buckets',parts:32};
    for(let i=0;i<32;i++)await add(`${key}_${i}`,buckets[i]);
   }else{layout[key]={type:'scalar'};await add(key,data);}
+  if(immutable&&fieldEntries.every(([name])=>nextSections.has(name)))nextFields.set(key,{value:data,layout:layout[key],entries:fieldEntries});
  }
- return {sections,payloads,meta:{format:backup.format,version:backup.version,appVersion:backup.appVersion,layout}};
+ if(cache){cache.sections=nextSections;cache.fields=nextFields;}
+ return {sections,payloads,stats,meta:{format:backup.format,version:backup.version,appVersion:backup.appVersion,layout}};
 }
 export function reconstructBackup(revision,entries){
  const layout=revision.meta.layout||{},state={};
@@ -126,41 +141,85 @@ export async function downloadBackup(profileId,appId,revision,onProgress=()=>{})
  const entries=Object.fromEntries(Object.entries(revision.sections).map(([key,hash])=>[key,values[hash]]));
  return reconstructBackup(revision,entries);
 }
+// Store a small, content-free diagnostic history per local profile. Storage
+// quota/privacy errors must never prevent a successful backup from completing.
+const diagnosticKey=(profileId,appId)=>`pwa.sync.metrics.v1:${profileId}:${appId}`;
+export function syncDiagnostics(profileId,appId){try{const value=JSON.parse(localStorage.getItem(diagnosticKey(profileId,appId))||'[]');return Array.isArray(value)?value.filter(entry=>entry&&typeof entry==='object'&&typeof entry.at==='string'&&['committed','unchanged','divergent','error'].includes(entry.status)).slice(0,10):[];}catch{return [];}}
+function rememberDiagnostic(profileId,appId,entry){try{localStorage.setItem(diagnosticKey(profileId,appId),JSON.stringify([entry,...syncDiagnostics(profileId,appId)].slice(0,10)));}catch{}}
+const sameMap=(a,b)=>Object.keys(a||{}).length===Object.keys(b||{}).length&&Object.entries(a||{}).every(([k,v])=>b?.[k]===v);
 /** Return committed, unchanged, or divergent. Network failures never produce forks. */
-export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{}}={}){
- const data=await splitBackup(backup);const revisionId=cursor?.pendingRevisionId||crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
- const remote=await fetchRevision(profileId,appId);
- // On reconnect, verify the last known parent; if it changed, let caller fork.
- const expected=cursor?.head??null;
- if((remote.head?.id??null)!==expected){
-  if(remote.head?.operationId===operationId)return {status:'committed',head:remote.head,stale:JSON.stringify(remote.head.sections)!==JSON.stringify(data.sections)};
-  return {status:'divergent',head:remote.head,expected};
- }
- if(remote.head&&JSON.stringify(remote.head.sections)===JSON.stringify(data.sections))return {status:'unchanged',head:remote.head};
- const known=new Set(Object.values(remote.head?.sections||{}));
- const pending=Object.entries(data.payloads).filter(([hash])=>!known.has(hash));
- const batches=[];let batch=[],bytes=0;
- for(const [hash,content] of pending){
-  const size=new TextEncoder().encode(content).length;
-  if(size>16*1024*1024)throw Error('Backup section exceeds 16 MiB');
-  if(batch.length&&(batch.length>=12||bytes+size>512*1024)){batches.push(batch);batch=[];bytes=0;}
-  batch.push({hash,content});bytes+=size;
- }
- if(batch.length)batches.push(batch);
- let completed=0;
- onProgress({completed,total:pending.length,stage:'uploading'});
- // Worker validates all hashes and stores each batch before acknowledging it.
- for(const group of batches){
-  await api('/objects/batch',{method:'POST',body:JSON.stringify({objects:group})});
-  completed+=group.length;onProgress({completed,total:pending.length,stage:'uploading'});
- }
- onProgress({completed,total:pending.length,stage:'committing'});
- const revision={format:1,id:revisionId,operationId,parent:expected,sections:data.sections,meta:data.meta,at:new Date().toISOString()};
- try{const done=await api(`/profiles/${profileId}/apps/${appId}/commit`,{method:'POST',body:JSON.stringify({expected,revision})});return {status:'committed',head:done.head};}
- catch(error){if(error.status===409)return {status:'divergent',head:error.details.head,expected};throw error;}
+export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{},cache}={}){
+ const started=Date.now(),metrics={at:new Date(started).toISOString(),status:'error',sections:0,changed:0,reused:0,payloadBytes:0,objectsSent:0,objectsCreated:null,requests:0,driveCalls:null,driveRetries:null,indexHits:null,indexMisses:null,objectScans:null,hashed:0,hashesReused:0,serialized:0,identityReused:0,preflightReused:0};
+ const collect=response=>{for(const key of ['driveCalls','driveRetries','indexHits','indexMisses','objectScans']){
+  const raw=response.headers.get(`X-PWA-${key}`);if(raw!==null&&/^\d+$/.test(raw))metrics[key]=(metrics[key]??0)+Number(raw);
+ }};
+ const call=(path,opts={})=>{metrics.requests++;return api(path,{...opts,onResponse:collect});};
+ const finish=result=>{metrics.status=result.status;return result;};
+ try{
+  const data=await splitBackup(backup,{cache}),revisionId=cursor?.pendingRevisionId||crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
+  metrics.sections=Object.keys(data.sections).length;metrics.hashed=data.stats.hashed;metrics.hashesReused=data.stats.reusedHashes;metrics.serialized=data.stats.serialized;metrics.identityReused=data.stats.identityReused;
+  const remote=await call(`/profiles/${profileId}/apps/${appId}/head`),expected=cursor?.head??null;
+  const known=new Set(Object.values(remote.head?.sections||{}));
+  metrics.changed=Object.values(data.sections).filter(hash=>!known.has(hash)).length;metrics.reused=metrics.sections-metrics.changed;
+  if((remote.head?.id??null)!==expected){
+   if(remote.head?.operationId===operationId)return finish({status:'committed',head:remote.head,stale:!sameMap(remote.head.sections,data.sections)});
+   return finish({status:'divergent',head:remote.head,expected});
+  }
+  if(remote.head&&sameMap(remote.head.sections,data.sections)&&JSON.stringify(remote.head.meta??data.meta)===JSON.stringify(data.meta))return finish({status:'unchanged',head:remote.head});
+  let pending=Object.keys(data.payloads).filter(hash=>!known.has(hash));
+  // An initial push or a large import may reuse objects in another profile or
+  // retained history. Ask once in bounded groups rather than send them again.
+  // Small routine changes skip the extra round trip. Older Workers return 404.
+  if(pending.length>=12||pending.some(h=>data.payloads[h].length>512*1024)){
+   const missing=[];let supported=true;
+   for(let i=0;i<pending.length;i+=128){const group=pending.slice(i,i+128);
+    try{const result=await call('/objects/missing',{method:'POST',body:JSON.stringify({hashes:group})});
+     if(!Array.isArray(result.missing)||result.missing.some(h=>!group.includes(h)))throw Error('Invalid object availability response');
+     missing.push(...new Set(result.missing));
+    }catch(e){if(e.status===404){supported=false;break;}throw e;}
+   }
+   if(supported){metrics.preflightReused=pending.length-missing.length;pending=missing;}
+  }
+  async function send(hashes){
+   const batches=[];let batch=[],bytes=0;
+   for(const hash of hashes){const content=data.payloads[hash],size=new TextEncoder().encode(content).length;
+    if(size>16*1024*1024)throw Error('Backup section exceeds 16 MiB');
+    if(batch.length&&(batch.length>=12||bytes+size>512*1024)){batches.push(batch);batch=[];bytes=0;}
+    batch.push({hash,content,size});bytes+=size;
+   }
+   if(batch.length)batches.push(batch);
+   let completed=0;onProgress({completed,total:hashes.length,stage:'uploading'});
+   for(const group of batches){
+    metrics.payloadBytes+=group.reduce((n,x)=>n+x.size,0);metrics.objectsSent+=group.length;
+    // The batch endpoint allows only 1 MiB; a large independent chapter uses
+    // the existing single-object PUT endpoint (16 MiB), not an oversized batch.
+    const result=group.length===1&&group[0].size>512*1024
+     ?await call(`/objects/${group[0].hash}`,{method:'PUT',body:group[0].content})
+     :await call('/objects/batch',{method:'POST',body:JSON.stringify({objects:group.map(({hash,content})=>({hash,content}))})});
+    if(Number.isInteger(result.created)&&result.created>=0)metrics.objectsCreated=(metrics.objectsCreated??0)+result.created;
+    completed+=group.length;onProgress({completed,total:hashes.length,stage:'uploading'});
+   }
+   onProgress({completed,total:hashes.length,stage:'committing'});
+  }
+  await send(pending);
+  const revision={format:1,id:revisionId,operationId,parent:expected,sections:data.sections,meta:data.meta,at:new Date().toISOString()};
+  const commit=()=>call(`/profiles/${profileId}/apps/${appId}/commit`,{method:'POST',body:JSON.stringify({expected,revision})});
+  try{
+   let done;try{done=await commit();}catch(error){
+    // Index reconciliation can discover an externally deleted object reused by
+    // the head. Repair only hashes in our own snapshot, never arbitrary data.
+    const missing=error.details?.missingHashes;
+    if(error.status!==422||!Array.isArray(missing)||!missing.length||missing.some(h=>!Object.hasOwn(data.payloads,h)))throw error;
+    await send([...new Set(missing)]);done=await commit();
+   }
+   return finish({status:'committed',head:done.head});
+  }catch(error){if(error.status===409)return finish({status:'divergent',head:error.details.head,expected});throw error;}
+ }catch(error){metrics.httpStatus=Number.isInteger(error.status)?error.status:null;throw error;}
+ finally{if(!metrics.objectsSent)metrics.objectsCreated=0;metrics.durationMs=Date.now()-started;rememberDiagnostic(profileId,appId,metrics);}
 }
 /** Debounced sync, visible progress and a truthful manual completion result. */
-export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDivergence}){
+export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDivergence,immutableFields=[]}){
+ const cache=createBackupCache({immutableFields});
  let timer=null,maxTimer=null,running=null,dirty=false,stopped=false,failures=0;
  let cursor=getSyncCursor(profileId,appId)||{head:null,localRevision:null,pendingOperationId:null,pendingRevisionId:null,pendingLocalRevision:null};
  const publish=(phase,extra={})=>onStatus?.({phase,...extra});
@@ -177,7 +236,7 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
     cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();
    }
    cursor.pendingLocalRevision=input.revision;persist();
-   const result=await uploadBackup(profileId,appId,input.backup,{...cursor},{onProgress:progress=>publish('syncing',progress)});
+   const result=await uploadBackup(profileId,appId,input.backup,{...cursor},{cache,onProgress:progress=>publish('syncing',progress)});
    if(result.status==='divergent'){
     publish('conflict');await onDivergence?.(result,input,cursor);
     return {status:'conflict'};

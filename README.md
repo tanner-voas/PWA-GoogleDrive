@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.4
+# PWA-GoogleDrive v0.1.8
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
@@ -52,3 +52,11 @@ Ciyan dictionary/grammar arrays and learning history remain independently hashed
 ## Account security (v0.1.7)
 
 See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md) for sign-out versus account-wide revocation, OAuth/session behavior, and backup retention.
+
+## v0.1.8 indexed incremental synchronization
+
+- Account-scoped Durable Object storage indexes Drive object hashes to file IDs. Positive entries expire after one hour; small misses use exact-name queries, and cold large snapshots may list the folder once. File IDs are not shared across accounts or folders. Folder lookups are cached for one minute in memory.
+- Reads always verify the SHA-256 of returned bytes. A stale ID is invalidated and looked up again; expired/missing entries are repaired from the local snapshot at commit. Managed garbage collection invalidates index entries before deleting objects. Manual edits/deletions in Drive can remain undetected until revalidation or a read; do not edit the backup folder by hand. The index is not a continuous integrity scrub.
+- A per-scheduler, bounded serialization/hash cache skips unchanged sections. Applications may opt into dictionary reference caching only for immutable copy-on-write arrays. No backup format changes. Large pushes preflight object existence to reuse retained data; old Workers fall back to ordinary transfers. Sections over 512 KiB use the existing single-object PUT endpoint (maximum 16 MiB raw section).
+- Transient Drive reads retry with bounded backoff; ambiguous writes are retried at the snapshot/revision layer, never blindly replayed. Retention maintenance timestamps are per app folder. All sibling writes settle before the account queue advances.
+- The last ten upload attempts are stored locally per profile/app, with section, payload, timing, API-call and cache counters. These diagnostics contain no learning data, text, hashes, or credentials; foreground counters may be incomplete for failed requests/older Workers.

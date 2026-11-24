@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {splitBackup,uploadBackup,downloadBackup,createSyncScheduler} from '../src/sync.js';
 import {AccountCoordinator} from '../worker/index.js';
+const memoryStorage=()=>{const data=new Map();return {get:async k=>Array.isArray(k)?new Map(k.filter(x=>data.has(x)).map(x=>[x,data.get(x)])):data.get(k),put:async(k,v)=>{if(typeof k==='string')data.set(k,v);else for(const [key,val] of Object.entries(k))data.set(key,val);},delete:async k=>{for(const key of Array.isArray(k)?k:[k])data.delete(key);}};};
 const response=(body,status=200)=>new Response(JSON.stringify(body),{status,headers:{'Content-Type':'application/json'}});
 const sample=()=>({format:'ciyan-backup',version:2,appVersion:'0.9.8',state:{cards:Array.from({length:270},(_,i)=>({id:`card-${i}`,hanzi:`词${i}`})),history:[{id:'h1'}],settings:{theme:'light'}}});
 
@@ -39,13 +40,13 @@ test('failed upload never commits or silently becomes successful',async()=>{
  finally{globalThis.fetch=original;}
 });
 
-test('Worker commits using one object listing rather than per-section Drive requests',async()=>{
+test('Worker commits using one targeted object lookup rather than per-section Drive requests',async()=>{
  const objects=new Set(),stored=[];
- const coord=new AccountCoordinator({storage:{},waitUntil(){}},{});
+ const coord=new AccountCoordinator({storage:memoryStorage(),waitUntil(){}},{});
  coord.folders=async()=>({objects:'objects'});
  coord.appFolder=async()=> 'app';
  coord.head=async()=>({head:null,file:null});
- coord.list=async(parent,name)=>{if(parent==='objects'){stored.push(name);return [...objects].map(name=>({name}));}return [];};
+ coord.list=async(parent,name)=>{if(parent==='objects'){stored.push(name);return [...objects].map(name=>({name,id:name}));}return [];};
  coord.createJSON=async(parent,name,text)=>{stored.push(name);return {id:name};};
  const split=await splitBackup(sample());
  for(const hash of Object.values(split.sections))objects.add(`${hash}.json`);
@@ -53,15 +54,16 @@ test('Worker commits using one object listing rather than per-section Drive requ
  const result=await coord.route({method:'POST',path:'/profiles/p/apps/ciyan/commit',body:JSON.stringify({expected:null,revision})});
  assert.equal(result.status,200);
  assert.equal(stored.filter(item=>item===null).length,0);
- assert.equal(stored.filter(item=>item===undefined).length,1); // One list for all object names
+ assert.equal(stored.filter(Array.isArray).length,1); // One targeted query for requested hashes
+ assert.equal(stored.filter(item=>item===undefined).length,0);
 });
 
 test('retry after interrupted head update resumes immutable revision without duplicating it',async()=>{
  const data=await splitBackup(sample()),files=new Map(),writes=[],known=new Set(Object.values(data.sections).map(h=>`${h}.json`));
- const ctx={storage:{get:async()=>Date.now(),put:async()=>{}},waitUntil(){}},coord=new AccountCoordinator(ctx,{});
+ const ctx={storage:memoryStorage(),waitUntil(){}},coord=new AccountCoordinator(ctx,{});
  coord.folders=async()=>({objects:'objects'});coord.appFolder=async()=> 'app';
  coord.head=async()=>({folder:'app',head:files.has('head.json')?JSON.parse(files.get('head.json')):null,file:files.has('head.json')?{id:'head.json'}:null});
- coord.list=async(folder,name)=>folder==='objects'?[...known].map(x=>({name:x})):name&&files.has(name)?[{name,id:name}]:[];
+ coord.list=async(folder,name)=>folder==='objects'?[...known].map(x=>({name:x,id:x})):name&&files.has(name)?[{name,id:name}]:[];
  coord.content=async id=>files.get(id);
  let failHead=true;
  coord.createJSON=async(_folder,name,content)=>{

@@ -67,7 +67,9 @@ export function setProfileRemote(id,remote,storage){return edit(data=>{const fou
 export function upsertProfile({id,name,remote=false},storage){if(!/^[a-zA-Z0-9_-]{1,80}$/.test(id))throw Error('Invalid profile ID');name=safeName(name);if(!name)throw Error('Profile name required');return edit(data=>{const found=data.profiles.find(p=>p.id===id);if(found){found.name=name;found.remote=found.remote||remote;}else data.profiles.push({id,name,remote,createdAt:new Date().toISOString()});},storage);}
 export function forkProfile(sourceId,name,storage){const id=globalThis.crypto.randomUUID();upsertProfile({id,name,remote:false},storage);return id;}
 export async function api(path='',opts={}){
- const response=await fetch(`${cloudEndpoint}${path}`,{credentials:'same-origin',...opts,headers:{...(opts.body?{'Content-Type':'application/json','X-PWA-CSRF':'1'}:{}),...opts.headers}});
+ const {onResponse,...requestOptions}=opts;
+ const response=await fetch(`${cloudEndpoint}${path}`,{credentials:'same-origin',...requestOptions,headers:{...(opts.body?{'Content-Type':'application/json','X-PWA-CSRF':'1'}:{}),...opts.headers}});
+ try{onResponse?.(response);}catch{}
  const json=await response.json().catch(()=>({error:`HTTP ${response.status}`}));
  if(!response.ok){const e=new Error(json.error||`HTTP ${response.status}`);e.status=response.status;e.details=json;throw e;}
  return json;
