@@ -7,7 +7,7 @@ const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const indexKey=(folder,hash)=>`object-index:v1:${folder}:${hash}`;
 const groups=(items,size)=>Array.from({length:Math.ceil(items.length/size)},(_,i)=>items.slice(i*size,(i+1)*size));
 // Never release the account queue while sibling Drive writes are still running.
-async function settleBatch(promises){const results=await Promise.allSettled(promises);const failure=results.find(r=>r.status==='rejected');if(failure)throw failure.reason;}
+async function settleBatch(promises){const results=await Promise.allSettled(promises);const failure=results.find(r=>r.status==='rejected');if(failure)throw failure.reason;return results.map(r=>r.value);}
 const json=(object,status=200,extra={})=>new Response(JSON.stringify(object),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',...extra}});
 const error=(status,message,extra={})=>json({error:message,...extra},status);
 const rand=()=>crypto.randomUUID();
@@ -233,8 +233,13 @@ export class AccountCoordinator {
  async profile(id,create=false){const folders=await this.folders(create);if(!folders?.profiles)return null;return this.folder(folders.profiles,id,create);}
  async meta(parent){const file=(await this.list(parent,'meta.json'))[0];return file?JSON.parse(await this.content(file.id)):null;}
  async appFolder(profileId,appId,create=false){const profile=await this.profile(profileId,create);return profile?this.folder(profile,appId,create):null;}
- async head(profileId,appId){const folder=await this.appFolder(profileId,appId,false);if(!folder)return {folder:null,file:null,head:null};const file=(await this.list(folder,'head.json'))[0]||null;
-  return {folder,file,head:file?JSON.parse(await this.content(file.id)):null};}
+ async head(profileId,appId,revisionName=null){const folder=await this.appFolder(profileId,appId,false);if(!folder)return {folder:null,file:null,head:null};
+   // One Drive metadata request can locate both the live head and the retry's
+   // immutable revision. Still read the real head; never trust a cached CAS.
+   const files=await this.list(folder,revisionName?['head.json',revisionName]:'head.json');
+   const file=files.find(f=>f.name==='head.json')||null;
+   return {folder,file,head:file?JSON.parse(await this.content(file.id)):null,
+    ...(revisionName?{stagedFile:files.find(f=>f.name===revisionName)||null}:{})};}
  async route(input){const {method,path,body}=input;const segments=path.split('/').filter(Boolean),payload=body?JSON.parse(body):{};
   if(method==='GET'&&path==='/profiles'){
    const folders=await this.folders(false);if(!folders?.profiles)return json({profiles:[]});const listing=await this.list(folders.profiles);const result=[];
@@ -263,7 +268,7 @@ export class AccountCoordinator {
      const folder=await this.appFolder(id,appId);if(!folder)return error(404,'Unknown app');const file=(await this.list(folder,`r_${segments[5]}.json`))[0];if(!file)return error(404,'Revision not found');return json({revision:JSON.parse(await this.content(file.id))});
     }
     if(segments[4]==='commit'&&method==='POST'){
-     const revision=checkRevision(payload.revision),h=await this.head(id,appId);const current=h.head,folder=h.folder||await this.appFolder(id,appId,true);
+     const revision=checkRevision(payload.revision),revisionName=`r_${revision.id}.json`,h=await this.head(id,appId,revisionName);const current=h.head,folder=h.folder||await this.appFolder(id,appId,true);
      if(current?.operationId===revision.operationId)return json({head:current,idempotent:true});
      if((current?.id||null)!==(payload.expected??null))return error(409,'Confirmed revision divergence',{head:current});
      if(revision.parent!==(payload.expected??null))return error(400,'Revision parent mismatch');
@@ -273,8 +278,7 @@ export class AccountCoordinator {
      if(missingHashes.length)return error(422,'Revision references missing backup sections',{missingHashes});
      // Revision creation and head update are separate Drive requests. If the
      // first succeeded and the second failed, retry the SAME revision ID.
-     const revisionName=`r_${revision.id}.json`;
-     const existingRevision=(await this.list(folder,revisionName))[0];
+     const existingRevision=h.stagedFile!==undefined?h.stagedFile:(await this.list(folder,revisionName))[0];
      let committedRevision=revision;
      if(existingRevision){
        const staged=checkRevision(JSON.parse(await this.content(existingRevision.id)));
@@ -376,10 +380,10 @@ export class AccountCoordinator {
    const apps=await this.list(p.id);
    for(const app of apps.filter(f=>f.mimeType===FOLDER)){
     const revisions=await this.list(app.id);
-    for(const file of revisions.filter(f=>f.name==='head.json'||/^r_[\w-]+\.json$/.test(f.name))){
-     // An incomplete/malformed historical record must STOP garbage collection.
-     const record=JSON.parse(await this.content(file.id));checkRevision(record);
-     for(const hash of Object.values(record.sections))referenced.add(hash);
+    for(const group of groups(revisions.filter(f=>f.name==='head.json'||/^r_[\w-]+\.json$/.test(f.name)),3)){
+     // Wait for all reads and validate every manifest before ANY deletion.
+     const records=await settleBatch(group.map(async file=>checkRevision(JSON.parse(await this.content(file.id)))));
+     for(const record of records)for(const hash of Object.values(record.sections))referenced.add(hash);
     }
    }
   }
@@ -399,7 +403,7 @@ export class AccountCoordinator {
  }
  async prune(folder,headId){
   const files=(await this.list(folder)).filter(f=>/^r_[\w-]+\.json$/.test(f.name)),items=[];
-  for(const file of files){const item=checkRevision(JSON.parse(await this.content(file.id)));items.push({id:item.id,at:item.at,file});}
+  for(const group of groups(files,3))items.push(...await settleBatch(group.map(async file=>{const item=checkRevision(JSON.parse(await this.content(file.id)));return {id:item.id,at:item.at,file};})));
   const keep=retainedIds(items);keep.add(headId);
   for(const item of items)if(!keep.has(item.id))await this.remove(item.file.id);
   // Content objects remain safe for forks and in-flight uploads. A dedicated,

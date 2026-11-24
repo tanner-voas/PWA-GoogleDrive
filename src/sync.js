@@ -146,17 +146,28 @@ export async function downloadBackup(profileId,appId,revision,onProgress=()=>{})
 const diagnosticKey=(profileId,appId)=>`pwa.sync.metrics.v1:${profileId}:${appId}`;
 export function syncDiagnostics(profileId,appId){try{const value=JSON.parse(localStorage.getItem(diagnosticKey(profileId,appId))||'[]');return Array.isArray(value)?value.filter(entry=>entry&&typeof entry==='object'&&typeof entry.at==='string'&&['committed','unchanged','divergent','error'].includes(entry.status)).slice(0,10):[];}catch{return [];}}
 function rememberDiagnostic(profileId,appId,entry){try{localStorage.setItem(diagnosticKey(profileId,appId),JSON.stringify([entry,...syncDiagnostics(profileId,appId)].slice(0,10)));}catch{}}
-const sameMap=(a,b)=>Object.keys(a||{}).length===Object.keys(b||{}).length&&Object.entries(a||{}).every(([k,v])=>b?.[k]===v);
+export const sameMap=(a,b)=>Object.keys(a||{}).length===Object.keys(b||{}).length&&Object.entries(a||{}).every(([k,v])=>b?.[k]===v);
+/** Recognize a successful write whose acknowledgement was lost. Only the
+ * exact durable pending operation and its parent can advance our cursor. */
+export function reconcilePendingCommit(cursor,head){
+ if(!cursor?.pendingOperationId||!cursor.pendingRevisionId||!Number.isSafeInteger(cursor.pendingLocalRevision)||cursor.pendingLocalRevision<0||
+    head?.operationId!==cursor.pendingOperationId||head.id!==cursor.pendingRevisionId||(head.parent??null)!==(cursor.head??null))return null;
+ return {head:head.id,localRevision:cursor.pendingLocalRevision,pendingOperationId:null,pendingRevisionId:null,pendingLocalRevision:null};
+}
 /** Return committed, unchanged, or divergent. Network failures never produce forks. */
 export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{},cache}={}){
- const started=Date.now(),metrics={at:new Date(started).toISOString(),status:'error',sections:0,changed:0,reused:0,payloadBytes:0,objectsSent:0,objectsCreated:null,requests:0,driveCalls:null,driveRetries:null,indexHits:null,indexMisses:null,objectScans:null,hashed:0,hashesReused:0,serialized:0,identityReused:0,preflightReused:0};
+ const started=Date.now(),metrics={at:new Date(started).toISOString(),status:'error',sections:0,changed:0,reused:0,payloadBytes:0,objectsSent:0,objectsCreated:null,requests:0,driveCalls:null,driveRetries:null,indexHits:null,indexMisses:null,objectScans:null,hashed:0,hashesReused:0,serialized:0,identityReused:0,preflightReused:0,prepareMs:0,headMs:0,preflightMs:0,uploadMs:0,commitMs:0};
  const collect=response=>{for(const key of ['driveCalls','driveRetries','indexHits','indexMisses','objectScans']){
   const raw=response.headers.get(`X-PWA-${key}`);if(raw!==null&&/^\d+$/.test(raw))metrics[key]=(metrics[key]??0)+Number(raw);
  }};
- const call=(path,opts={})=>{metrics.requests++;return api(path,{...opts,onResponse:collect});};
+ const call=async(path,opts={})=>{metrics.requests++;const start=Date.now();
+  const metric=path.endsWith('/head')?'headMs':path.endsWith('/commit')?'commitMs':path==='/objects/missing'?'preflightMs':'uploadMs';
+  try{return await api(path,{...opts,onResponse:collect});}finally{metrics[metric]+=Date.now()-start;}
+ };
  const finish=result=>{metrics.status=result.status;return result;};
  try{
-  const data=await splitBackup(backup,{cache}),revisionId=cursor?.pendingRevisionId||crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
+  const data=await splitBackup(backup,{cache});metrics.prepareMs=Date.now()-started;
+  const revisionId=cursor?.pendingRevisionId||crypto.randomUUID(),operationId=cursor?.pendingOperationId||crypto.randomUUID();
   metrics.sections=Object.keys(data.sections).length;metrics.hashed=data.stats.hashed;metrics.hashesReused=data.stats.reusedHashes;metrics.serialized=data.stats.serialized;metrics.identityReused=data.stats.identityReused;
   const remote=await call(`/profiles/${profileId}/apps/${appId}/head`),expected=cursor?.head??null;
   const known=new Set(Object.values(remote.head?.sections||{}));
@@ -231,14 +242,25 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
   try{
    const input=await readBackup();
    if(cursor.pendingLocalRevision!==null&&cursor.pendingLocalRevision!==undefined&&cursor.pendingLocalRevision!==input.revision){
-    // The previous attempt may have staged a different snapshot. Never reuse
-    // its immutable revision name for a newly edited local snapshot.
+    // A previous commit may already be durable even if its response was lost.
+    // Confirm that receipt BEFORE retiring its operation/revision identifiers.
+    // If the head is unrelated, ordinary CAS/divergence handling still applies.
+    if(cursor.pendingOperationId&&cursor.pendingRevisionId){
+     const {head}=await fetchRevision(profileId,appId);
+     const confirmed=reconcilePendingCommit(cursor,head);
+     if(confirmed){cursor=confirmed;persist();}
+    }
+    // Never reuse an immutable revision name for a different snapshot.
     cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();
    }
    cursor.pendingLocalRevision=input.revision;persist();
    const result=await uploadBackup(profileId,appId,input.backup,{...cursor},{cache,onProgress:progress=>publish('syncing',progress)});
    if(result.status==='divergent'){
-    publish('conflict');await onDivergence?.(result,input,cursor);
+    publish('conflict');const resolution=await onDivergence?.(result,input,cursor);
+    if(resolution?.cursor){cursor=resolution.cursor;persist();failures=0;
+     if(dirty||cursor.localRevision!==input.revision){dirty=true;publish('pending');return {status:'pending'};}
+     publish('synced',{revision:input.revision});return {status:'unchanged',head:{id:cursor.head}};}
+    if(resolution?.retry)throw Error('Cloud revision could not be confirmed; synchronization will retry.');
     return {status:'conflict'};
    }
    cursor={head:result.head?.id||null,localRevision:result.stale?-1:input.revision,pendingOperationId:null,pendingRevisionId:null,pendingLocalRevision:null};
@@ -265,11 +287,11 @@ export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDiver
   if(!cursor.pendingOperationId){cursor.pendingOperationId=crypto.randomUUID();cursor.pendingRevisionId=crypto.randomUUID();cursor.pendingLocalRevision=null;persist();}
   else if(!cursor.pendingRevisionId){cursor.pendingRevisionId=crypto.randomUUID();persist();}
   schedule();if(!maxTimer)maxTimer=setTimeout(()=>{void flush().catch(()=>{});},60000);
-  publish('pending');
+  if(!running)publish('pending');
  }
  async function now({force=false}={}){
   if(stopped)throw Error('Synchronization is stopped');
-  if(running){await running;}
+  if(running){const active=await running;if(active.status==='conflict')throw Error('A different cloud revision was found; local data was preserved');}
   // Home/Refresh must not issue a network request when local data is already
   // confirmed. The manual Sync button may still explicitly check the head.
   if(!dirty&&!force)return {status:'unchanged',head:cursor.head};
