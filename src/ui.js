@@ -23,6 +23,7 @@ const NAME_MAX=64;
 // document-level singleton prevents them from keeping competing click handlers.
 const PROFILE_CONTROLLER=Symbol.for('pwa.profile.manager.controller');
 export function installProfileUI({adapter={}}={}){
+ const appName=adapter.appName||'Ciyan',statusEvent=adapter.statusEvent||'ciyan-cloud-status';
  document[PROFILE_CONTROLLER]?.destroy();
  const listeners=new AbortController();
  if(!document.getElementById('pwa-profile-style')){const style=document.createElement('style');style.id='pwa-profile-style';style.textContent=profileStyles;document.head.append(style);}
@@ -51,7 +52,7 @@ export function installProfileUI({adapter={}}={}){
     return `<button class="pwa-profile-row" data-pwa="switch" data-id="${esc(item.id)}" ${busy?'disabled':''}><strong>${collision?'<span class="pwa-profile-collision" aria-label="Duplicate name">✕</span>':''}${esc(item.name)}</strong>${item.id===p.id?' · Current':''}<div class="pwa-profile-muted">${cloud?'Google Drive':'Local'}${collision?' · Same name as current local profile':''}</div></button>`;
    }).join('');inner+=row('back','Back');
   }else if(screen==='rename'){
-   inner=`<p>Renaming changes the profile label, not its stored learning records.</p><form id="pwa-profile-form"><label for="pwa-new-name">Profile name</label><input id="pwa-new-name" maxlength="64" value="${esc(p.name)}" required><div class="pwa-profile-actions"><button type="button" data-pwa="back">Cancel</button><button type="submit" ${busy?'disabled':''}>Save name</button></div></form>`;
+   inner=`<p>Renaming changes the profile label, not its stored ${esc(adapter.appName?'application data':'learning records')}.</p><form id="pwa-profile-form"><label for="pwa-new-name">Profile name</label><input id="pwa-new-name" maxlength="64" value="${esc(p.name)}" required><div class="pwa-profile-actions"><button type="button" data-pwa="back">Cancel</button><button type="submit" ${busy?'disabled':''}>Save name</button></div></form>`;
   }else if(screen==='push'){
    const candidate=remote.find(r=>r.id!==p.id&&r.name===p.name);
    inner=`<p class="pwa-profile-error">A cloud profile named <strong>${esc(p.name)}</strong> already exists. This operation will create a new revision of that profile, preserving previous cloud history. Your local profile will not be deleted.</p><form id="pwa-profile-form"><label for="pwa-confirm">Type <strong>${esc('OVERWRITE '+p.name)}</strong> to continue</label><input id="pwa-confirm" autocomplete="off" required><div class="pwa-profile-actions"><button type="button" data-pwa="back">Cancel</button><button type="submit" data-target="${esc(candidate?.id||'')}" ${busy?'disabled':''}>Overwrite</button></div></form>`;
@@ -62,7 +63,7 @@ export function installProfileUI({adapter={}}={}){
    if(p.remote&&adapter.onFork)inner+=row('fork','Fork profile','');
    if(connected()){
     if(!p.remote&&adapter.onPush)inner+=row('push','Push profile',{detail:'Create and verify the complete Google Drive backup'});
-    if(p.remote&&adapter.onSync)inner+=row('sync','Sync now',{detail:'Upload any pending Ciyan changes'});
+    if(p.remote&&adapter.onSync)inner+=row('sync','Sync now',{detail:`Upload any pending ${appName} changes`});
     inner+=row('disconnect','Sign out on this device',{detail:'Keep Google authorization and all saved backups'});
     inner+=row('revoke','Revoke Google Drive access',{detail:'Disconnect all devices and remove stored authorization; keep backups'});
    }else if(connection!=='checking')inner+=row('connect','Connect Google Drive');
@@ -87,7 +88,7 @@ export function installProfileUI({adapter={}}={}){
   if(!destroyed&&initialAction==='push'&&connected())await perform('push');
  }
  async function push(targetId=null){return safe(async()=>{
-  if(!adapter.onPush)throw Error('Open Ciyan to upload this profile');
+  if(!adapter.onPush)throw Error(`Open ${appName} to upload this profile`);
   const p=currentProfile();const result=await adapter.onPush({targetId,name:p.name});
   // No profile is promoted locally until the app has independently verified
   // the initial cloud revision. The app may copy its database to targetId.
@@ -144,7 +145,7 @@ export function installProfileUI({adapter={}}={}){
  },{signal:listeners.signal});
  document.addEventListener('submit',e=>{if(overlay?.contains(e.target)&&e.target.id==='pwa-profile-form'){e.preventDefault();void submit(e.target);}},{signal:listeners.signal});
  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!busy)close();},{signal:listeners.signal});
- window.addEventListener('ciyan-cloud-status',()=>{if(overlay)draw();},{signal:listeners.signal});
+ window.addEventListener(statusEvent,()=>{if(overlay)draw();},{signal:listeners.signal});
  if(sessionStorage.getItem('pwa:connect-pending')){sessionStorage.removeItem('pwa:connect-pending');setTimeout(()=>{if(!destroyed)void open();},100);}
  const controller={open,refreshCloud,close,destroy};
  document[PROFILE_CONTROLLER]=controller;

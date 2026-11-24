@@ -64,7 +64,7 @@ test('large upload preflight reuses retained content and sends oversized section
   if(path.endsWith('/objects/'+large)){assert.equal(opts.method,'PUT');assert.equal(opts.body,split.payloads[large]);return response({stored:true,created:1});}
   if(path.endsWith('/commit'))return response({head:JSON.parse(opts.body).revision});throw Error('Unexpected '+path);
  };
- try{assert.equal((await uploadBackup('p','app',backup,{head:null})).status,'committed');assert.equal(calls.length,4);const [stats]=syncDiagnostics('p','app');assert.equal(stats.objectsSent,1);assert.equal(stats.preflightReused,Object.keys(split.payloads).length-1);assert.equal(stats.driveCalls,4);assert.equal(stats.payloadBytes,2*1024*1024+2);assert.equal(stats.objectsCreated,1);assert(!JSON.stringify(stats).includes('xxxxx'));}
+ try{assert.equal((await uploadBackup('p','ciyan',backup,{head:null})).status,'committed');assert.equal(calls.length,4);const [stats]=syncDiagnostics('p','ciyan');assert.equal(stats.objectsSent,1);assert.equal(stats.preflightReused,Object.keys(split.payloads).length-1);assert.equal(stats.driveCalls,4);assert.equal(stats.payloadBytes,2*1024*1024+2);assert.equal(stats.objectsCreated,1);assert(!JSON.stringify(stats).includes('xxxxx'));}
  finally{globalThis.fetch=original;if(oldStorage===undefined)delete globalThis.localStorage;else globalThis.localStorage=oldStorage;}
 });
 test('a missing previously referenced section is repaired without a fork or a different operation ID',async()=>{
@@ -74,7 +74,7 @@ test('a missing previously referenced section is repaired without a fork or a di
   if(path.endsWith('/objects/batch')){sent.push(...JSON.parse(opts.body).objects.map(o=>o.hash));return Response.json({created:1});}
   if(path.endsWith('/commit')){const {revision}=JSON.parse(opts.body);assert.equal(revision.id,'pending');assert.equal(revision.operationId,'operation');if(++commits===1)return Response.json({error:'Missing',missingHashes:[missing]},{status:422});return Response.json({head:revision});}throw Error(path);
  };
- try{const result=await uploadBackup('p','app',backup,{head:'base',pendingRevisionId:'pending',pendingOperationId:'operation'});assert.equal(result.status,'committed');assert.equal(commits,2);assert.equal(sent.at(-1),missing);assert.equal(sent.length,2);}
+ try{const result=await uploadBackup('p','ciyan',backup,{head:'base',pendingRevisionId:'pending',pendingOperationId:'operation'});assert.equal(result.status,'committed');assert.equal(commits,2);assert.equal(sent.at(-1),missing);assert.equal(sent.length,2);}
  finally{globalThis.fetch=original;}
 });
 test('transient safe Drive reads retry; permission failures and ambiguous writes do not',async()=>{

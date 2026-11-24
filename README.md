@@ -67,3 +67,11 @@ A retry checks whether its exact pending operation already became the cloud head
 ### Network performance telemetry
 
 See [NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) for the account-wide, profile-independent Drive telemetry format, retention, and export instructions.
+
+### v0.1.11: app-owned backup adapters (Item 7D)
+
+See [APP_BACKUP_ADAPTER.md](APP_BACKUP_ADAPTER.md) for the explicit snapshot,
+partition, validation, restore and synchronization contract. The Ciyan codec lives
+in `src/ciyan-codec.js`; all existing imports and stored layouts remain compatible.
+`src/app-backup.js` supports future, opt-in application adapters without interpreting
+Ciyan-specific data fields. No additional app is cloud-enabled by this release.
