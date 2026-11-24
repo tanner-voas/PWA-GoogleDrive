@@ -1,0 +1,2 @@
+import test from 'node:test';import assert from 'node:assert/strict';import {readFileSync} from 'node:fs';
+test('standalone manager is an additional profile origin, not a replacement for existing apps',()=>{const cfg=JSON.parse(readFileSync(new URL('../wrangler.jsonc',import.meta.url),'utf8'));assert.deepEqual(cfg.vars.ALLOWED_ORIGINS.split(','),['https://applauncher.tannervoas.workers.dev','https://ciyan.tannervoas.workers.dev','https://pwa-git-api.tannervoas.workers.dev']);});
