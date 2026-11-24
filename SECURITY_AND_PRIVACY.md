@@ -14,3 +14,7 @@ Drive snapshot content is JSON, not end-to-end encrypted; the service and your G
 ## Deployment checks
 
 Deploy the profile Worker from main before relying on the new revoke control. Confirm Google Auth Platform → Audience is Production if long-lived refresh tokens are required; Testing mode can expire Drive-scope refresh tokens after seven days. Verify OAuth callback and login on both configured origins, then use a disposable account/profile to exercise sign-out and revocation across two browsers. Confirm that both sessions are invalidated, backup files remain and re-consent restores access. Never use your only active profile for destructive tests.
+
+### Network performance telemetry
+
+Authenticated cloud operations produce bounded, profile-independent diagnostic metrics in the account's own Google Drive `AppLauncher Profiles/telemetry` folder. No study content, profile identity, credentials, or raw request paths are exported. See [NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) for fields, retention, and opt-out.

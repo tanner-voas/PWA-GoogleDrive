@@ -63,3 +63,7 @@ See [SECURITY_AND_PRIVACY.md](SECURITY_AND_PRIVACY.md) for sign-out versus accou
 
 ### v0.1.9: finalization and concurrent edits
 A retry checks whether its exact pending operation already became the cloud head before assigning new IDs to a changed snapshot. Ciyan also recognizes this receipt when restarting. Commit combines the head/revision metadata search while preserving the real head read, all referenced-object checks, and history-before-head writes. Retention manifest reads use bounded batches of three, still serialized against commits; cleanup can still delay an account request. Local diagnostic timings distinguish preparation, head lookup, preflight, upload and commit (including queue/network delay). Initial profile promotion still performs full checksum-verified download and reconstruction.
+
+### Network performance telemetry
+
+See [NETWORK_TELEMETRY.md](NETWORK_TELEMETRY.md) for the account-wide, profile-independent Drive telemetry format, retention, and export instructions.

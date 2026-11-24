@@ -1,3 +1,4 @@
+import {NetworkTelemetry,classifyRequest,requestSample,readClientSamples} from './network-telemetry.js';
 import {retainedIds,checkRevision} from '../src/retention.js';
 const PREFIX='/_profiles/v1',ROOT='AppLauncher Profiles',DRIVE='https://www.googleapis.com/drive/v3/files',UPLOAD='https://www.googleapis.com/upload/drive/v3/files';
 const ID=/^[A-Za-z0-9_-]{1,80}$/,SHA=/^[a-f0-9]{64}$/,FOLDER='application/vnd.google-apps.folder';
@@ -5,10 +6,12 @@ const enc=new TextEncoder(),dec=new TextDecoder();
 const INDEX_TTL=60*60*1000, FOLDER_TTL=60*1000;
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const indexKey=(folder,hash)=>`object-index:v1:${folder}:${hash}`;
+const freshMetrics=()=>({driveCalls:0,driveRetries:0,indexHits:0,indexMisses:0,objectScans:0,driveHeaderMs:0,driveHeaderMaxMs:0,drive4xx:0,drive5xx:0,drive429:0,driveNetworkErrors:0});
 const groups=(items,size)=>Array.from({length:Math.ceil(items.length/size)},(_,i)=>items.slice(i*size,(i+1)*size));
 // Never release the account queue while sibling Drive writes are still running.
 async function settleBatch(promises){const results=await Promise.allSettled(promises);const failure=results.find(r=>r.status==='rejected');if(failure)throw failure.reason;return results.map(r=>r.value);}
-const json=(object,status=200,extra={})=>new Response(JSON.stringify(object),{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',...extra}});
+const responseLengths=new WeakMap();
+const json=(object,status=200,extra={})=>{const text=JSON.stringify(object),response=new Response(text,{status,headers:{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store','X-Content-Type-Options':'nosniff','Referrer-Policy':'no-referrer',...extra}});responseLengths.set(response,text.length);return response;};
 const error=(status,message,extra={})=>json({error:message,...extra},status);
 const rand=()=>crypto.randomUUID();
 const b64=bytes=>btoa(String.fromCharCode(...new Uint8Array(bytes))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -68,14 +71,15 @@ export default {async fetch(request,env){
    if(request.headers.get('X-PWA-CSRF')!=='1'||(origin&&origin!==url.origin)||site==='cross-site')return error(403,'Invalid request origin or CSRF guard');
   }
   const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));
-  const response=await internal(stub,'/api',{sid:session.sid,method:request.method,path,body:request.method==='GET'?null:await request.text()});
+  const response=await internal(stub,'/api',{sid:session.sid,method:request.method,path,body:request.method==='GET'?null:await request.text(),telemetryApp:request.headers.get('X-PWA-Telemetry-App'),telemetry:request.headers.get('X-PWA-Telemetry')?.slice(0,4097)});
   if((path==='/logout'||path==='/revoke')&&response.ok){const headers=new Headers(response.headers);headers.append('Set-Cookie',cookie(SESSION,'',0));return new Response(response.body,{status:response.status,headers});}
   return response;
  }catch(e){return error(502,e.message==='Google OAuth token exchange failed'?e.message:'Cloud synchronization request failed');}
 }};
 
 export class AccountCoordinator {
- constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.folderCache=new Map();this.metrics=null;}
+ constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.folderCache=new Map();this.metrics=null;this.telemetry=new NetworkTelemetry(ctx.storage);}
+ async alarm(){return this.serial(async()=>{if(this.env.NETWORK_TELEMETRY==='off'){try{await this.telemetry.clear();}catch{}return;}await this.telemetry.flush(this);});}
  async fetch(request){const url=new URL(request.url);let input;try{input=await request.json();}catch{return error(400,'Invalid request');}
   if(url.pathname==='/login'){
    const run=async()=>{
@@ -89,18 +93,34 @@ export class AccountCoordinator {
    return this.serial(run);
   }
   if(url.pathname!=='/api')return error(404,'Unknown account operation');
-  const run=async()=>{try{
-   const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
-   if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch){if(session)await this.ctx.storage.delete(`session:${input.sid}`);return input.path==='/status'?json({connected:false}):error(401,'Session expired or revoked; reconnect Google Drive');}
-   if(input.path==='/logout'&&input.method==='POST'){await this.ctx.storage.delete(`session:${input.sid}`);return json({disconnected:true});}
-   if(input.path==='/revoke'&&input.method==='POST')return await this.revokeAuthorization(input);
-   if(input.path==='/status'&&input.method==='GET')return json({connected:true,email:session.email});
-   this.metrics={driveCalls:0,driveRetries:0,indexHits:0,indexMisses:0,objectScans:0};
-   try{const response=await this.route(input),headers=new Headers(response.headers);
-    for(const [key,value] of Object.entries(this.metrics))headers.set(`X-PWA-${key}`,String(value));
-    return new Response(response.body,{status:response.status,headers});
-   }finally{this.metrics=null;}
-  }catch(e){const msg=String(e.message||e);if(msg.startsWith('Google authorization expired'))return error(401,msg);if(msg.startsWith('Conflict:'))return error(409,msg.slice(9));const code=/Drive API (403|404|429|5\d\d)/.exec(msg)?.[1];return error(502,code?`Google Drive returned HTTP ${code}; local data is safe. Retry or check Cloudflare logs.`:'Google Drive operation failed. Local data is safe; retry later.',{stage:input.path});}};
+  const queuedAt=Date.now();
+  const run=async()=>{const started=Date.now();let scope=null,samples=null,label=null,response;
+   try{
+    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
+    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch){if(session)await this.ctx.storage.delete(`session:${input.sid}`);return input.path==='/status'?json({connected:false}):error(401,'Session expired or revoked; reconnect Google Drive');}
+    if(input.path==='/logout'&&input.method==='POST'){await this.ctx.storage.delete(`session:${input.sid}`);return json({disconnected:true});}
+    if(input.path==='/revoke'&&input.method==='POST')return await this.revokeAuthorization(input);
+    // A session-specific digest is used only for piggyback routing, not auth,
+    // and is never stored in the telemetry journal or Drive files.
+    if(this.env.NETWORK_TELEMETRY!=='off'&&await this.telemetry.enabled()){
+     try{scope=hex(await crypto.subtle.digest('SHA-256',enc.encode('pwa-telemetry-v1:'+input.sid)));samples=readClientSamples(input.telemetry,scope);label=classifyRequest(input.method,input.path,input.telemetryApp);}catch{}
+    }
+    if(input.path==='/status'&&input.method==='GET')response=json({connected:true,email:session.email});
+    else{this.metrics=freshMetrics();response=await this.route(input);}
+   }catch(e){const msg=String(e.message||e);const code=/Drive API (403|404|429|5\d\d)/.exec(msg)?.[1];response=msg.startsWith('Google authorization expired')?error(401,msg):msg.startsWith('Conflict:')?error(409,msg.slice(9)):error(502,code?`Google Drive returned HTTP ${code}; local data is safe. Retry or check Cloudflare logs.`:'Google Drive operation failed. Local data is safe; retry later.',{stage:input.path});}
+   finally{if(!response)this.metrics=null;}
+   const metrics=this.metrics;this.metrics=null;
+   const headers=new Headers(response.headers);
+   if(metrics)for(const [key,value] of Object.entries(metrics))headers.set(`X-PWA-${key}`,String(value));
+   if(scope){
+    headers.set('X-PWA-Telemetry-Scope',scope);
+    try{const records=samples?[...samples]:[];
+     if(label)records.push(requestSample({label,status:response.status,queueMs:started-queuedAt,serviceMs:Date.now()-started,requestChars:typeof input.body==='string'?input.body.length:0,responseChars:responseLengths.get(response),metrics}));
+     if(records.length&&await this.telemetry.append(records)&&samples)headers.set('X-PWA-Telemetry-Ack','1');
+    }catch{} // Telemetry can never change the response or sync outcome.
+   }
+   return new Response(response.body,{status:response.status,headers});
+  };
   return this.serial(run);
  }
  // No Drive files are removed. The account epoch makes every prior session unusable,
@@ -124,6 +144,7 @@ export class AccountCoordinator {
   const epoch=rand();this.access=null;this.folderCache.clear();
   await this.ctx.storage.transaction(async tx=>{await tx.put('authorizationEpoch',epoch);await tx.delete('refresh');});
   try{await this.cleanSessions(epoch);}catch{} // old sessions are already invalidated
+  try{await this.telemetry.clear();}catch{} // exported telemetry remains in Drive
   return json({revoked:googleRevocationConfirmed,disconnected:true,storedAuthorizationRemoved:true});
  }
  async cleanSessions(epoch){
@@ -142,17 +163,27 @@ export class AccountCoordinator {
   let result;try{result=await googleToken(this.env,{client_id:this.env.GOOGLE_CLIENT_ID,client_secret:this.env.GOOGLE_CLIENT_SECRET,refresh_token:refresh,grant_type:'refresh_token'});}catch(e){if(e.status===400||e.status===401||e.status===403)throw Error('Google authorization expired: reconnect Google Drive');throw Error('Temporary Google token service failure');}
   this.access={value:result.access_token,exp:Date.now()+Math.min(Number(result.expires_in)||3600,3600)*1000};return this.access.value;
  }
- bump(key,n=1){if(this.metrics)this.metrics[key]+=n;}
+ bump(key,n=1){if(this.metrics)this.metrics[key]=(this.metrics[key]||0)+n;}
+ async timed(key,fn){const start=Date.now();try{return await fn();}finally{this.bump(key,Date.now()-start);}}
+ async maintenance(operation,app,fn){
+  const start=Date.now(),previous=this.metrics;this.metrics=freshMetrics();let status=200;
+  try{return await fn();}catch(e){status=502;throw e;}finally{
+   const metrics=this.metrics;this.metrics=previous;
+   if(this.env.NETWORK_TELEMETRY!=='off')try{await this.telemetry.append([requestSample({label:{kind:'maintenance',operation,app},status,queueMs:0,serviceMs:Date.now()-start,requestChars:0,responseChars:0,metrics})]);}catch{}
+  }
+ }
  async drive(url,options={}){
   // Only retry safe reads automatically. Ambiguous create/commit writes must
   // resume through the immutable revision/object reconciliation protocol.
   const safe=(options.method||'GET')==='GET';let refreshed=false;
   for(let attempt=0;;attempt++){
    const token=await this.token();let res;
-   this.bump('driveCalls');
-   try{res=await fetch(url,{...options,headers:{Authorization:`Bearer ${token}`,...options.headers}});}
-   catch(e){if(!safe||attempt>=2)throw Error('Drive network request failed');this.bump('driveRetries');await wait(250*2**attempt+Math.random()*150);continue;}
+   this.bump('driveCalls');const started=Date.now();
+   const timing=()=>{const elapsed=Date.now()-started;if(this.metrics){this.bump('driveHeaderMs',elapsed);this.metrics.driveHeaderMaxMs=Math.max(this.metrics.driveHeaderMaxMs||0,elapsed);}};
+   try{res=await fetch(url,{...options,headers:{Authorization:`Bearer ${token}`,...options.headers}});timing();}
+   catch(e){timing();this.bump('driveNetworkErrors');if(!safe||attempt>=2)throw Error('Drive network request failed');this.bump('driveRetries');await wait(250*2**attempt+Math.random()*150);continue;}
    if(res.ok)return res;
+   if(res.status>=500)this.bump('drive5xx');else if(res.status>=400)this.bump('drive4xx');if(res.status===429)this.bump('drive429');
    if(res.status===404)this.folderCache.clear();
    if(res.status===401){this.access=null;if(safe&&!refreshed&&attempt<2){refreshed=true;this.bump('driveRetries');continue;}throw Error('Google authorization expired: reconnect Google Drive');}
    let rateLimited=res.status===429||res.status>=500;
@@ -268,16 +299,17 @@ export class AccountCoordinator {
      const folder=await this.appFolder(id,appId);if(!folder)return error(404,'Unknown app');const file=(await this.list(folder,`r_${segments[5]}.json`))[0];if(!file)return error(404,'Revision not found');return json({revision:JSON.parse(await this.content(file.id))});
     }
     if(segments[4]==='commit'&&method==='POST'){
-     const revision=checkRevision(payload.revision),revisionName=`r_${revision.id}.json`,h=await this.head(id,appId,revisionName);const current=h.head,folder=h.folder||await this.appFolder(id,appId,true);
+     const revision=checkRevision(payload.revision),revisionName=`r_${revision.id}.json`,h=await this.timed('commitHeadMs',()=>this.head(id,appId,revisionName));const current=h.head,folder=h.folder||await this.appFolder(id,appId,true);
      if(current?.operationId===revision.operationId)return json({head:current,idempotent:true});
      if((current?.id||null)!==(payload.expected??null))return error(409,'Confirmed revision divergence',{head:current});
      if(revision.parent!==(payload.expected??null))return error(400,'Revision parent mismatch');
      const objects=(await this.folders(true)).objects;
-     const hashes=[...new Set(Object.values(revision.sections))],present=await this.resolveObjects(objects,hashes);
+     const hashes=[...new Set(Object.values(revision.sections))],present=await this.timed('commitObjectsMs',()=>this.resolveObjects(objects,hashes));
      const missingHashes=hashes.filter(hash=>!present.has(hash));
      if(missingHashes.length)return error(422,'Revision references missing backup sections',{missingHashes});
      // Revision creation and head update are separate Drive requests. If the
      // first succeeded and the second failed, retry the SAME revision ID.
+     const revisionStarted=Date.now();
      const existingRevision=h.stagedFile!==undefined?h.stagedFile:(await this.list(folder,revisionName))[0];
      let committedRevision=revision;
      if(existingRevision){
@@ -290,8 +322,8 @@ export class AccountCoordinator {
          return error(409,'Revision ID already belongs to different content');
        committedRevision=staged;
      }else await this.createJSON(folder,revisionName,JSON.stringify(revision));
-     if(h.file)await this.replaceJSON(h.file.id,JSON.stringify(committedRevision));
-     else await this.createJSON(folder,'head.json',JSON.stringify(committedRevision));
+     this.bump('commitRevisionMs',Date.now()-revisionStarted);
+     await this.timed('commitPublishMs',async()=>{if(h.file)await this.replaceJSON(h.file.id,JSON.stringify(committedRevision));else await this.createJSON(folder,'head.json',JSON.stringify(committedRevision));});
      // Successful cloud commit must not wait for pruning or mark/sweep.
      // Durable Object storage persists maintenance checkpoints across restarts.
      this.ctx.waitUntil(this.serial(async()=>{
@@ -299,12 +331,12 @@ export class AccountCoordinator {
          const pruneKey=`last-prune:${folder}`;
          const lastPrune=await this.ctx.storage.get(pruneKey)||0;
          if(Date.now()-lastPrune>24*3600000){
-           await this.prune(folder,revision.id);
+           await this.maintenance('retention_prune',classifyRequest('POST',path)?.app||'other',()=>this.prune(folder,revision.id));
            await this.ctx.storage.put(pruneKey,Date.now());
          }
          const last=await this.ctx.storage.get('last-gc')||0;
          if(Date.now()-last>7*86400000){
-           await this.collectGarbage();
+           await this.maintenance('object_gc','other',()=>this.collectGarbage());
            await this.ctx.storage.put('last-gc',Date.now());
          }
        }catch{} // Maintenance must never turn a successful backup into a failure.

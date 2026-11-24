@@ -1,3 +1,4 @@
+import {queueBackupTelemetry,telemetryScope} from './network-telemetry.js';
 import {api} from './profiles.js';
 /** Cloud snapshots are immutable JSON sections addressed by SHA-256. */
 export const hex=bytes=>[...new Uint8Array(bytes)].map(b=>b.toString(16).padStart(2,'0')).join('');
@@ -134,7 +135,7 @@ export async function downloadBackup(profileId,appId,revision,onProgress=()=>{})
  const hashes=[...new Set(Object.values(revision.sections))],values={};
  for(let i=0;i<hashes.length;i+=8){
   const group=hashes.slice(i,i+8);
-  const response=await api('/objects/read-batch',{method:'POST',body:JSON.stringify({hashes:group})});
+  const response=await api('/objects/read-batch',{method:'POST',body:JSON.stringify({hashes:group}),telemetryApp:appId});
   Object.assign(values,response.objects);
   onProgress({completed:Math.min(i+8,hashes.length),total:hashes.length,stage:'downloading'});
  }
@@ -156,13 +157,13 @@ export function reconcilePendingCommit(cursor,head){
 }
 /** Return committed, unchanged, or divergent. Network failures never produce forks. */
 export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=>{},cache}={}){
- const started=Date.now(),metrics={at:new Date(started).toISOString(),status:'error',sections:0,changed:0,reused:0,payloadBytes:0,objectsSent:0,objectsCreated:null,requests:0,driveCalls:null,driveRetries:null,indexHits:null,indexMisses:null,objectScans:null,hashed:0,hashesReused:0,serialized:0,identityReused:0,preflightReused:0,prepareMs:0,headMs:0,preflightMs:0,uploadMs:0,commitMs:0};
+ const started=Date.now(),scope=telemetryScope(),metrics={at:new Date(started).toISOString(),status:'error',sections:0,changed:0,reused:0,payloadBytes:0,objectsSent:0,objectsCreated:null,requests:0,driveCalls:null,driveRetries:null,indexHits:null,indexMisses:null,objectScans:null,hashed:0,hashesReused:0,serialized:0,identityReused:0,preflightReused:0,prepareMs:0,headMs:0,preflightMs:0,uploadMs:0,commitMs:0};
  const collect=response=>{for(const key of ['driveCalls','driveRetries','indexHits','indexMisses','objectScans']){
   const raw=response.headers.get(`X-PWA-${key}`);if(raw!==null&&/^\d+$/.test(raw))metrics[key]=(metrics[key]??0)+Number(raw);
  }};
  const call=async(path,opts={})=>{metrics.requests++;const start=Date.now();
   const metric=path.endsWith('/head')?'headMs':path.endsWith('/commit')?'commitMs':path==='/objects/missing'?'preflightMs':'uploadMs';
-  try{return await api(path,{...opts,onResponse:collect});}finally{metrics[metric]+=Date.now()-start;}
+  try{return await api(path,{...opts,telemetryApp:appId,onResponse:collect});}finally{metrics[metric]+=Date.now()-start;}
  };
  const finish=result=>{metrics.status=result.status;return result;};
  try{
@@ -226,7 +227,7 @@ export async function uploadBackup(profileId,appId,backup,cursor,{onProgress=()=
    return finish({status:'committed',head:done.head});
   }catch(error){if(error.status===409)return finish({status:'divergent',head:error.details.head,expected});throw error;}
  }catch(error){metrics.httpStatus=Number.isInteger(error.status)?error.status:null;throw error;}
- finally{if(!metrics.objectsSent)metrics.objectsCreated=0;metrics.durationMs=Date.now()-started;rememberDiagnostic(profileId,appId,metrics);}
+ finally{if(!metrics.objectsSent)metrics.objectsCreated=0;metrics.durationMs=Date.now()-started;rememberDiagnostic(profileId,appId,metrics);queueBackupTelemetry(appId,{...metrics,appVersion:backup?.appVersion},scope);}
 }
 /** Debounced sync, visible progress and a truthful manual completion result. */
 export function createSyncScheduler({profileId,appId,readBackup,onStatus,onDivergence,immutableFields=[]}){
