@@ -1,3 +1,5 @@
+import {WorkspaceTelemetry} from './workspace-telemetry.js';
+import {adaptDriveSample} from '../src/workspace-telemetry-schema.js';
 import {NetworkTelemetry,classifyRequest,requestSample,readClientSamples} from './network-telemetry.js';
 import {retainedIds,checkRevision} from '../src/retention.js';
 const PREFIX='/_profiles/v1',ROOT='AppLauncher Profiles',DRIVE='https://www.googleapis.com/drive/v3/files',UPLOAD='https://www.googleapis.com/upload/drive/v3/files';
@@ -65,7 +67,7 @@ export default {async fetch(request,env){
   if(path==='/auth/start'&&request.method==='GET')return oauthStart(request,env,url);
   if(path==='/auth/callback'&&request.method==='GET')return oauthCallback(request,env,url);
   const session=await unsign(cookies(request)[SESSION],env);
-  if(!session||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return path==='/status'?json({connected:false}):error(401,'Connect Google Drive to continue');
+  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return path==='/status'?json({connected:false}):error(401,'Connect Google Drive to continue');
   if(request.method!=='GET'){
    const origin=request.headers.get('Origin'),site=request.headers.get('Sec-Fetch-Site');
    if(request.headers.get('X-PWA-CSRF')!=='1'||(origin&&origin!==url.origin)||site==='cross-site')return error(403,'Invalid request origin or CSRF guard');
@@ -77,9 +79,33 @@ export default {async fetch(request,env){
  }catch(e){return error(502,e.message==='Google OAuth token exchange failed'?e.message:'Cloud synchronization request failed');}
 }};
 
+/** RPC only. Public fetch has no route to these functions. The calling Worker
+ * must check its own administrator authorization before enrollment. */
+export async function telemetrySession(env,origin,cookieHeader,action){
+ try{if(!['status','enable','disable'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+ const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
+ if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
+ const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
+ if(data.generation){const generation=data.generation,epoch=data.epoch;delete data.generation;delete data.epoch;data.capability=await sign({epoch,type:'workspace-telemetry',sub:session.sub,generation,exp:Date.now()+365*86400000},env);}
+ return data;
+ }catch{return {error:'Telemetry service unavailable'};}
+}
+export async function telemetryAppend(env,capability,events){
+ try{if(!Array.isArray(events)||events.length>64||new TextEncoder().encode(JSON.stringify(events)).length>262144)return {error:'Invalid telemetry batch'};
+ const token=await unsign(capability,env);if(token?.type!=='workspace-telemetry'||!/^\d+$/.test(String(token.sub))||!ID.test(token.generation||''))return {error:'Telemetry capability expired or invalid'};
+ const r=await internal(env.ACCOUNTS.get(env.ACCOUNTS.idFromName(token.sub)),'/workspace-telemetry/append',{generation:token.generation,epoch:token.epoch??null,events});return await r.json();
+ }catch{return {error:'Telemetry service unavailable'};}
+}
 export class AccountCoordinator {
- constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.folderCache=new Map();this.metrics=null;this.telemetry=new NetworkTelemetry(ctx.storage);}
- async alarm(){return this.serial(async()=>{if(this.env.NETWORK_TELEMETRY==='off'){try{await this.telemetry.clear();}catch{}return;}await this.telemetry.flush(this);});}
+ constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.folderCache=new Map();this.metrics=null;this.telemetry=new NetworkTelemetry(ctx.storage);this.workspaceTelemetry=new WorkspaceTelemetry(ctx.storage);}
+ async alarm(){return this.serial(async()=>{if(this.env.NETWORK_TELEMETRY==='off'){try{await this.telemetry.clear();}catch{}}else await this.telemetry.flush(this);
+  this.metrics=freshMetrics();try{const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==(await this.ctx.storage.get('authorizationEpoch')??null))await this.workspaceTelemetry.disable();else await this.workspaceTelemetry.tick(this);}finally{const metrics=this.metrics;this.metrics=null;if(metrics.driveCalls)try{await this.workspaceTelemetry.addArchiveMetrics(metrics);}catch{} }
+  // Legacy and v2 share one account alarm; re-arm after either writer changes it.
+  await this.workspaceTelemetry.arm();});}
+ async appendTelemetry(records){const m=await this.workspaceTelemetry.meta();if(!m.enabled||m.epoch!==(await this.ctx.storage.get('authorizationEpoch')??null))return this.telemetry.append(records);
+  const mapped=records.map(r=>adaptDriveSample(r,crypto.randomUUID())).filter(Boolean);if(!mapped.length)return false;
+  const result=await this.workspaceTelemetry.append(mapped);return result.accepted+result.duplicates===mapped.length;
+ }
  async fetch(request){const url=new URL(request.url);let input;try{input=await request.json();}catch{return error(400,'Invalid request');}
   if(url.pathname==='/login'){
    const run=async()=>{
@@ -92,6 +118,17 @@ export class AccountCoordinator {
    };
    return this.serial(run);
   }
+  if(url.pathname==='/workspace-telemetry/session')return this.serial(async()=>{
+   const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
+   if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
+   if(input.action==='enable'){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
+   if(input.action==='disable')await this.workspaceTelemetry.disable();else if(input.action!=='status')return error(400,'Invalid telemetry action');else{const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)await this.workspaceTelemetry.disable();}
+   return json(await this.workspaceTelemetry.status());
+  });
+  if(url.pathname==='/workspace-telemetry/append')return this.serial(async()=>{
+   const m=await this.workspaceTelemetry.meta();if(!m.enabled||m.generation!==input.generation||m.epoch!==input.epoch||input.epoch!==(await this.ctx.storage.get('authorizationEpoch')??null)||!await this.ctx.storage.get('refresh'))return error(403,'Telemetry capability revoked');
+   return json(await this.workspaceTelemetry.append(input.events,Date.now(),input.generation));
+  });
   if(url.pathname!=='/api')return error(404,'Unknown account operation');
   const queuedAt=Date.now();
   const run=async()=>{const started=Date.now();let scope=null,samples=null,label=null,response;
@@ -116,7 +153,7 @@ export class AccountCoordinator {
     headers.set('X-PWA-Telemetry-Scope',scope);
     try{const records=samples?[...samples]:[];
      if(label)records.push(requestSample({label,status:response.status,queueMs:started-queuedAt,serviceMs:Date.now()-started,requestChars:typeof input.body==='string'?input.body.length:0,responseChars:responseLengths.get(response),metrics}));
-     if(records.length&&await this.telemetry.append(records)&&samples)headers.set('X-PWA-Telemetry-Ack','1');
+     if(records.length&&await this.appendTelemetry(records)&&samples)headers.set('X-PWA-Telemetry-Ack','1');
     }catch{} // Telemetry can never change the response or sync outcome.
    }
    return new Response(response.body,{status:response.status,headers});
@@ -144,6 +181,7 @@ export class AccountCoordinator {
   const epoch=rand();this.access=null;this.folderCache.clear();
   await this.ctx.storage.transaction(async tx=>{await tx.put('authorizationEpoch',epoch);await tx.delete('refresh');});
   try{await this.cleanSessions(epoch);}catch{} // old sessions are already invalidated
+  try{await this.workspaceTelemetry.disable();}catch{}
   try{await this.telemetry.clear();}catch{} // exported telemetry remains in Drive
   return json({revoked:googleRevocationConfirmed,disconnected:true,storedAuthorizationRemoved:true});
  }
@@ -169,7 +207,7 @@ export class AccountCoordinator {
   const start=Date.now(),previous=this.metrics;this.metrics=freshMetrics();let status=200;
   try{return await fn();}catch(e){status=502;throw e;}finally{
    const metrics=this.metrics;this.metrics=previous;
-   if(this.env.NETWORK_TELEMETRY!=='off')try{await this.telemetry.append([requestSample({label:{kind:'maintenance',operation,app},status,queueMs:0,serviceMs:Date.now()-start,requestChars:0,responseChars:0,metrics})]);}catch{}
+   if(this.env.NETWORK_TELEMETRY!=='off')try{await this.appendTelemetry([requestSample({label:{kind:'maintenance',operation,app},status,queueMs:0,serviceMs:Date.now()-start,requestChars:0,responseChars:0,metrics})]);}catch{}
   }
  }
  async drive(url,options={}){
@@ -197,14 +235,19 @@ export class AccountCoordinator {
    await wait(Math.max(250*2**attempt+Math.random()*150,delay||0));
   }
  }
- async list(parent,name=null){const result=[];let page=null;
+ async list(parent,name=null,telemetryMetadata=false){const result=[];let page=null;
   const quote=v=>`'${v.replace(/\\/g,'\\\\').replace(/'/g,"\\'")}'`;
   const names=Array.isArray(name)?name:name?[name]:[];
   const filter=names.length?` and (${names.map(n=>`name = ${quote(n)}`).join(' or ')})`:'';
-  do{const params=new URLSearchParams({q:`${quote(parent)} in parents and trashed = false${filter}`,fields:'nextPageToken,files(id,name,mimeType,createdTime,modifiedTime)',pageSize:'1000'});if(page)params.set('pageToken',page);
+  do{const params=new URLSearchParams({q:`${quote(parent)} in parents and trashed = false${filter}`,fields:telemetryMetadata?'nextPageToken,files(id,name,mimeType,createdTime,modifiedTime,size,appProperties)':'nextPageToken,files(id,name,mimeType,createdTime,modifiedTime)',pageSize:'1000'});if(page)params.set('pageToken',page);
    const json=await (await this.drive(`${DRIVE}?${params}`)).json();result.push(...(json.files||[]));page=json.nextPageToken||null;
   }while(page);return result;
  }
+ async telemetryStorageQuota(){const r=await this.drive('https://www.googleapis.com/drive/v3/about?fields=storageQuota');const data=(await r.json()).storageQuota||{};const out={};for(const k of ['limit','usage','usageInDrive','usageInDriveTrash'])if(typeof data[k]==='string'&&/^\d+$/.test(data[k])&&Number.isSafeInteger(Number(data[k])))out[k]=Number(data[k]);return out;}
+ async listTelemetry(parent){const files=[];let page=null;for(let i=0;i<4;i++){
+  const params=new URLSearchParams({q:`'${parent.replace(/'/g,"\\'")}' in parents and trashed = false and appProperties has { key='pwaTelemetry' and value='v2' }`,fields:'nextPageToken,files(id,name,size,appProperties)',pageSize:'1000',orderBy:'name'});if(page)params.set('pageToken',page);
+  const data=await (await this.drive(`${DRIVE}?${params}`)).json();files.push(...(data.files||[]));page=data.nextPageToken||null;if(!page)return {files,complete:true};
+ }return {files,complete:false};}
  async folder(parent,name,create=false){
   const key=JSON.stringify([parent,name]),cached=this.folderCache.get(key);
   if(cached?.expires>Date.now())return cached.id;
@@ -253,8 +296,8 @@ export class AccountCoordinator {
  }
  async createMetadata(body){return (await this.drive(DRIVE,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();}
  async content(id){const r=await this.drive(`${DRIVE}/${encodeURIComponent(id)}?alt=media`);return r.text();}
- async createJSON(parent,name,text){const boundary=`pwa_${rand().replace(/-/g,'')}`;
-  const body=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({name,mimeType:'application/json',parents:[parent]})}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${text}\r\n--${boundary}--`;
+ async createJSON(parent,name,text,metadata={}){const boundary=`pwa_${rand().replace(/-/g,'')}`;
+  const body=`--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify({name,mimeType:'application/json',parents:[parent],...metadata})}\r\n--${boundary}\r\nContent-Type: application/json\r\n\r\n${text}\r\n--${boundary}--`;
   return (await this.drive(`${UPLOAD}?uploadType=multipart`,{method:'POST',headers:{'Content-Type':`multipart/related; boundary=${boundary}`},body})).json();
  }
  async replaceJSON(id,text){await this.drive(`${UPLOAD}/${encodeURIComponent(id)}?uploadType=media`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:text});}

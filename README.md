@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.13
+# PWA-GoogleDrive v0.1.14
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
@@ -75,3 +75,6 @@ partition, validation, restore and synchronization contract. The Ciyan codec liv
 in `src/ciyan-codec.js`; all existing imports and stored layouts remain compatible.
 `src/app-backup.js` supports future, opt-in application adapters without interpreting
 Ciyan-specific data fields. No additional app is cloud-enabled by this release.
+
+## Unified telemetry foundation
+See `WORKSPACE_TELEMETRY.md`. Existing network-v1 files and behavior are preserved until explicit enrollment from GitManager.

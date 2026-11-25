@@ -1,6 +1,6 @@
 {
   "name": "pwa-profiles-api",
-  "main": "worker/index.js",
+  "main": "worker/entrypoint.js",
   "compatibility_date": "2026-11-23",
   "workers_dev": true,
   "vars": { "ALLOWED_ORIGINS": "https://applauncher.tannervoas.workers.dev,https://ciyan.tannervoas.workers.dev,https://pwa-git-api.tannervoas.workers.dev" },
