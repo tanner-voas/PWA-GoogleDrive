@@ -70,7 +70,9 @@ export class WorkspaceTelemetry{
      m.lastReceipt={name,count:events.length,bytes:new TextEncoder().encode(content).length,verifiedAt:new Date(now).toISOString()};m.lastError=null;m.lastStage='verified';m.failures=0;
      const ids=new Set(b.ids);m.queue=m.queue.filter(x=>!ids.has(x.id));m.seen=[...m.seen,...b.ids].slice(-1024);m.batch=null;m.dropped=Math.max(0,m.dropped-b.dropped);m.lastFlush=now;m.archiveBytes=m.archiveBytes===null?null:m.archiveBytes+(existing.length?0:new TextEncoder().encode(content).length);
      if(!m.oldest||Date.parse(m.oldest)>b.min)m.oldest=new Date(b.min).toISOString();
-     m.nextFlush=m.queue.length?now+FLUSH:0;m.nextPrune=m.archiveBytes===null||m.archiveBytes>CAP?now:(m.nextPrune?Math.min(m.nextPrune,now+DAY):now+DAY);
+     // After a verified batch, a full remaining batch is already due. Avoid a
+     // fifteen-minute pause that fills the bounded spool under sustained load.
+     m.nextFlush=m.queue.length?now+(m.queue.length>=BATCH?1000:FLUSH):0;m.nextPrune=m.archiveBytes===null||m.archiveBytes>CAP?now:(m.nextPrune?Math.min(m.nextPrune,now+DAY):now+DAY);
      await this.s.transaction(async tx=>{await tx.put(META,m);await tx.delete(b.ids.map(row));});
     }else{m.nextFlush=0;await this.s.put(META,m);}
    }
