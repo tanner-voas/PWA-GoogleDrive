@@ -1,6 +1,7 @@
 import {normalizeTelemetryQuery,queryTelemetry} from './telemetry-query.js';
 import {WorkspaceTelemetry} from './workspace-telemetry.js';
-import {adaptDriveSample} from '../src/workspace-telemetry-schema.js';
+import pkg from '../package.json' with {type:'json'};
+import {adaptDriveSample,createEvent} from '../src/workspace-telemetry-schema.js';
 import {NetworkTelemetry,classifyRequest,requestSample,readClientSamples} from './network-telemetry.js';
 import {retainedIds,checkRevision} from '../src/retention.js';
 const PREFIX='/_profiles/v1',ROOT='AppLauncher Profiles',DRIVE='https://www.googleapis.com/drive/v3/files',UPLOAD='https://www.googleapis.com/upload/drive/v3/files';
@@ -83,10 +84,11 @@ export default {async fetch(request,env){
 /** RPC only. Public fetch has no route to these functions. The calling Worker
  * must check its own administrator authorization before enrollment. */
 export async function telemetrySession(env,origin,cookieHeader,action,query=null){
- try{if(!['status','enable','disable','flush','drain','query'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+ try{if(!['status','enable','disable','flush','drain','query','checkpoint-owner'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
  const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
  const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action,query});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
+ if(action==='checkpoint-owner')return {ownerHash:hex(await crypto.subtle.digest('SHA-256',enc.encode(JSON.stringify([String(session.sub),data.epoch??null]))))};
  if(data.generation){const generation=data.generation,epoch=data.epoch;delete data.generation;delete data.epoch;data.capability=await sign({epoch,type:'workspace-telemetry',sub:session.sub,generation,exp:Date.now()+365*86400000},env);}
  return data;
  }catch{return {error:'Telemetry service unavailable'};}
@@ -124,6 +126,7 @@ export class AccountCoordinator {
   if(url.pathname==='/workspace-telemetry/session')return this.serial(async()=>{
    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
+   if(input.action==='checkpoint-owner')return json({epoch});
    if(input.action==='query'){const q=normalizeTelemetryQuery(input.query);if(!q)return error(400,'Invalid archive query');return json(await queryTelemetry(this,q));}
    if(input.action==='enable'){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
    if(input.action==='disable'||input.action==='drain'){
@@ -142,10 +145,11 @@ export class AccountCoordinator {
   });
   if(url.pathname!=='/api')return error(404,'Unknown account operation');
   const queuedAt=Date.now();
-  const run=async()=>{const started=Date.now();let scope=null,samples=null,label=null,response;
+  const run=async()=>{const started=Date.now();let scope=null,samples=null,label=null,response,measurementEpoch,measure=false;
    try{
     const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
     if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch){if(session)await this.ctx.storage.delete(`session:${input.sid}`);return input.path==='/status'?json({connected:false}):error(401,'Session expired or revoked; reconnect Google Drive');}
+    measure=(input.method==='POST'&&(input.path==='/profiles'||/^\/profiles\/[A-Za-z0-9_-]{1,80}\/apps\/[a-z][a-z0-9-]{0,31}\/commit$/.test(input.path)))||(input.method==='PATCH'&&/^\/profiles\/[A-Za-z0-9_-]{1,80}$/.test(input.path));measurementEpoch=epoch;
     if(input.path==='/logout'&&input.method==='POST'){await this.ctx.storage.delete(`session:${input.sid}`);return json({disconnected:true});}
     if(input.path==='/revoke'&&input.method==='POST')return await this.revokeAuthorization(input);
     // A session-specific digest is used only for piggyback routing, not auth,
@@ -167,6 +171,8 @@ export class AccountCoordinator {
      if(records.length&&await this.appendTelemetry(records)&&samples)headers.set('X-PWA-Telemetry-Ack','1');
     }catch{} // Telemetry can never change the response or sync outcome.
    }
+   // Selected profile mutations only; account-coordinator service time, not edge CPU/billing.
+   if(measure)try{const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch===measurementEpoch){const event=createEvent('cloudflare-worker','request',{app:'pwa-google-drive',appVersion:pkg.version,coverage:'partial',status:response.status,outcome:response.status>=400?'error':'success',severity:response.status>=500?'error':response.status>=400?'warning':'info',metrics:{requests:1,durationMs:Date.now()-started,queueMs:started-queuedAt}});if(event)await this.workspaceTelemetry.append([event]);}}catch{}
    return new Response(response.body,{status:response.status,headers});
   };
   return this.serial(run);
