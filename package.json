@@ -1,4 +1,4 @@
 {
-  "name":"pwa-google-drive","version":"0.1.23","private":true,"type":"module",
+  "name":"pwa-google-drive","version":"0.1.24","private":true,"type":"module",
   "scripts":{"test":"node --test tests/*.test.js","check":"node --check src/app-backup.js && node --check src/ciyan-codec.js && node --check src/backup-hash.js && node --check src/profiles.js && node --check src/sync.js && node --check src/ui.js && node --check worker/index.js && node --check src/network-telemetry.js && node --check worker/network-telemetry.js && node --check worker/workspace-telemetry.js && node --check worker/telemetry-query.js && node --check worker/entrypoint.js && node --check src/workspace-telemetry-schema.js","deploy":"npx --yes wrangler@4 deploy"}
 }
