@@ -5,6 +5,6 @@ export {AccountCoordinator} from './index.js';
 // service bindings in the same account; never proxy arbitrary RPC calls.
 export default class ProfilesWorker extends WorkerEntrypoint {
  fetch(request){return http.fetch(request,this.env);}
- telemetrySession(origin,cookieHeader,action){return telemetrySession(this.env,origin,cookieHeader,action);}
+ telemetrySession(origin,cookieHeader,action,query){return telemetrySession(this.env,origin,cookieHeader,action,query);}
  telemetryAppend(capability,events){return telemetryAppend(this.env,capability,events);}
 }

@@ -1,3 +1,4 @@
+import {normalizeTelemetryQuery,queryTelemetry} from './telemetry-query.js';
 import {WorkspaceTelemetry} from './workspace-telemetry.js';
 import {adaptDriveSample} from '../src/workspace-telemetry-schema.js';
 import {NetworkTelemetry,classifyRequest,requestSample,readClientSamples} from './network-telemetry.js';
@@ -81,11 +82,11 @@ export default {async fetch(request,env){
 
 /** RPC only. Public fetch has no route to these functions. The calling Worker
  * must check its own administrator authorization before enrollment. */
-export async function telemetrySession(env,origin,cookieHeader,action){
- try{if(!['status','enable','disable','flush','drain'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+export async function telemetrySession(env,origin,cookieHeader,action,query=null){
+ try{if(!['status','enable','disable','flush','drain','query'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
  const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
- const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
+ const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action,query});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
  if(data.generation){const generation=data.generation,epoch=data.epoch;delete data.generation;delete data.epoch;data.capability=await sign({epoch,type:'workspace-telemetry',sub:session.sub,generation,exp:Date.now()+365*86400000},env);}
  return data;
  }catch{return {error:'Telemetry service unavailable'};}
@@ -123,6 +124,7 @@ export class AccountCoordinator {
   if(url.pathname==='/workspace-telemetry/session')return this.serial(async()=>{
    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
+   if(input.action==='query'){const q=normalizeTelemetryQuery(input.query);if(!q)return error(400,'Invalid archive query');return json(await queryTelemetry(this,q));}
    if(input.action==='enable'){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
    if(input.action==='disable'||input.action==='drain'){
     const m=await this.workspaceTelemetry.meta();
