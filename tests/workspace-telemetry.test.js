@@ -29,3 +29,15 @@ test('recent receipts identify exact verified chunks and correlation across rest
  for(let i=2;i<=10;i++){await j.append([event(now+i*2*FLUSH-1)],now+i*2*FLUSH-1);s.fire();await j.tick(d,now+i*2*FLUSH+FLUSH);}
  a=await j.status();assert.equal(a.recentReceipts.length,8);assert.deepEqual(a.recentReceipts.at(-1),a.lastReceipt);await j.disable();assert.equal((await j.status()).recentReceipts.length,0);
 });
+
+test('explicit shutdown drains every batch immediately and reconciles a failed write without dropping pending',async()=>{
+ const {j,now}=await ready(),d=drive();for(let i=0;i<2;i++)await j.append(Array.from({length:64},()=>event(now)),now);
+ const initial=await j.status();d.lose();assert.equal(await j.drainPending(d,now),false);assert.equal((await j.status()).pending,129);assert.equal((await j.status()).droppedEvents,initial.droppedEvents);
+ assert.equal(await j.drainPending(d,now+1),true);assert.equal((await j.status()).pending,0);assert.equal(d.files.size,3);assert.equal([...d.files.values()].reduce((sum,f)=>sum+JSON.parse(f.content).count,0),129);
+ await j.disable();assert.equal((await j.status()).enabled,false);assert.equal((await j.status()).droppedEvents,initial.droppedEvents);
+});
+test('explicit account disable leaves archive enabled on failed verification and drains before completing',async()=>{
+ const s=store(),d=drive();await s.put('refresh','encrypted');await s.put('session:live',{exp:Date.now()+60000,epoch:null});const c=new AccountCoordinator({storage:s},{});Object.assign(c,d);await c.workspaceTelemetry.enable();await c.workspaceTelemetry.append([event()]);d.lose();
+ const invoke=()=>c.fetch(new Request('https://internal/workspace-telemetry/session',{method:'POST',body:JSON.stringify({sid:'live',action:'disable'})}));
+ const blocked=await (await invoke()).json();assert.equal(blocked.enabled,true);assert.equal(blocked.drainBlocked,true);assert.equal(blocked.pending,2);const done=await (await invoke()).json();assert.equal(done.enabled,false);assert.equal(done.pending,0);assert.equal(done.droppedEvents,0);assert.equal(d.files.size,1);
+});

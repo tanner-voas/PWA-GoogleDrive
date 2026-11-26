@@ -82,7 +82,7 @@ export default {async fetch(request,env){
 /** RPC only. Public fetch has no route to these functions. The calling Worker
  * must check its own administrator authorization before enrollment. */
 export async function telemetrySession(env,origin,cookieHeader,action){
- try{if(!['status','enable','disable','flush'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+ try{if(!['status','enable','disable','flush','drain'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
  const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
  const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
@@ -124,7 +124,14 @@ export class AccountCoordinator {
    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
    if(input.action==='enable'){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
-   if(input.action==='disable')await this.workspaceTelemetry.disable();else if(input.action==='status'||input.action==='flush'){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)await this.workspaceTelemetry.disable();if(input.action==='flush'){if(!m.enabled||m.epoch!==epoch)return error(409,'Archive disabled');if(await this.workspaceTelemetry.requestFlush())await this.flushWorkspace();}await this.workspaceTelemetry.arm();}else return error(400,'Invalid telemetry action');
+   if(input.action==='disable'||input.action==='drain'){
+    const m=await this.workspaceTelemetry.meta();
+    if(m.enabled&&m.epoch!==epoch)return error(401,'Telemetry authorization expired');
+    if(m.enabled){this.metrics=freshMetrics();let drained;try{drained=await this.workspaceTelemetry.drainPending(this);}finally{const metrics=this.metrics;this.metrics=null;if(metrics.driveCalls)await this.workspaceTelemetry.addArchiveMetrics(metrics);}
+     if(!drained)return json({...await this.workspaceTelemetry.status(),drainBlocked:true});
+     if(input.action==='disable')await this.workspaceTelemetry.disable();
+    }
+   }else if(input.action==='status'||input.action==='flush'){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)await this.workspaceTelemetry.disable();if(input.action==='flush'){if(!m.enabled||m.epoch!==epoch)return error(409,'Archive disabled');if(await this.workspaceTelemetry.requestFlush())await this.flushWorkspace();}await this.workspaceTelemetry.arm();}else return error(400,'Invalid telemetry action');
    return json(await this.workspaceTelemetry.status());
   });
   if(url.pathname==='/workspace-telemetry/append')return this.serial(async()=>{

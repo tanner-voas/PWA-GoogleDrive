@@ -19,6 +19,15 @@ export class WorkspaceTelemetry{
   await this.arm(undefined,now);return (await this.meta()).generation;
  }
  async requestFlush(now=Date.now()){const m=await this.meta();if(!m.enabled||!m.queue.length)return false;if(m.lastManual&&now-m.lastManual<FIRST_FLUSH)return false;m.lastManual=now;m.nextFlush=now;await this.s.put(META,m);await this.arm(m,now);return true;}
+ async drainPending(drive,now=Date.now()){
+  // Explicit shutdown/prepare: never expire pending records to manufacture success.
+  for(let i=0;i<Math.ceil(LIMIT/BATCH)+1;i++){
+   const m=await this.meta();if(!m.enabled||!m.queue.length)return m.queue.length===0;
+   m.nextFlush=now;await this.s.put(META,m);await this.tick(drive,now,{preservePending:true});
+   const after=await this.meta();if(after.failures||after.queue.length>=m.queue.length)return false;
+  }
+  return !(await this.meta()).queue.length;
+ }
  async disable(){const m=await this.meta();const keys=m.queue.map(x=>row(x.id));await this.s.transaction(async tx=>{for(let i=0;i<keys.length;i+=64)await tx.delete(keys.slice(i,i+64));await tx.put(META,{...defaults(),droppedTotal:m.droppedTotal+m.queue.length,archiveBytes:m.archiveBytes,oldest:m.oldest,lastFlush:m.lastFlush,lastReceipt:m.lastReceipt,archiveCalls:m.archiveCalls,archiveRetries:m.archiveRetries,archive429:m.archive429,pruned:m.pruned});});}
  async append(values,now=Date.now(),generation=null){
   if(!Array.isArray(values)||!values.length||values.length>BATCH)return {accepted:0,duplicates:0,rejected:values?.length||0};
@@ -49,7 +58,7 @@ export class WorkspaceTelemetry{
   for(const x of managed){if(removed<8&&(Number(x.match[2])<now-RETAIN||complete&&bytes>CAP)){await drive.remove(x.f.id);bytes-=Number(x.f.size);removed++;}else remaining.push(x);}
   m.archiveBytes=complete?bytes:null;m.oldest=complete&&remaining.length?new Date(Number(remaining[0].match[2])).toISOString():null;m.pruned+=removed;m.nextPrune=now+(removed===8?FLUSH:DAY);return m;
  }
- async tick(drive,now=Date.now()){
+ async tick(drive,now=Date.now(),{preservePending=false}={}){
   let m=await this.meta();if(!m.enabled)return;
   if(!await this.s.get('refresh')){await this.disable();return;}
   if(!((m.nextFlush&&m.nextFlush<=now)||(m.nextPrune&&m.nextPrune<=now))){await this.arm(m,now);return;}
@@ -57,8 +66,8 @@ export class WorkspaceTelemetry{
   try{
    if(m.nextFlush&&m.nextFlush<=now){
     m.lastAttempt=now;m.lastStage=stage;await this.s.put(META,m);
-    if(!m.batch){const expired=m.queue.filter(x=>x.received<now-MAX_PENDING_AGE);if(expired.length){m.queue=m.queue.filter(x=>x.received>=now-MAX_PENDING_AGE);m.dropped+=expired.length;m.droppedTotal+=expired.length;await this.s.transaction(async tx=>{for(let i=0;i<expired.length;i+=64)await tx.delete(expired.slice(i,i+64).map(x=>row(x.id)));await tx.put(META,m);});}}
-    if(m.batch&&Date.parse(m.batch.createdAt)<now-MAX_PENDING_AGE){ // explicit loss of unverifiable pending batch; not a successful receipt
+    if(!preservePending&&!m.batch){const expired=m.queue.filter(x=>x.received<now-MAX_PENDING_AGE);if(expired.length){m.queue=m.queue.filter(x=>x.received>=now-MAX_PENDING_AGE);m.dropped+=expired.length;m.droppedTotal+=expired.length;await this.s.transaction(async tx=>{for(let i=0;i<expired.length;i+=64)await tx.delete(expired.slice(i,i+64).map(x=>row(x.id)));await tx.put(META,m);});}}
+    if(!preservePending&&m.batch&&Date.parse(m.batch.createdAt)<now-MAX_PENDING_AGE){ // explicit loss of unverifiable pending batch; not a successful receipt
      const ids=new Set(m.batch.ids);m.queue=m.queue.filter(x=>!ids.has(x.id));m.dropped+=ids.size;m.droppedTotal+=ids.size;m.batch=null;await this.s.transaction(async tx=>{await tx.delete([...ids].map(row));await tx.put(META,m);});
     }
     m=await this.freeze(m,now);
