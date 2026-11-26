@@ -3,7 +3,7 @@
 export const SCHEMA=2, DAY=86400000, MAX_EVENT_BYTES=4096;
 const sources={
  'google-drive':['profiles_list','profile_create','profile_rename','objects_missing','objects_read_batch','objects_write_batch','object_write','object_read','head','commit','history','revisions','retention_prune','object_gc','backup','archive_enable','archive_flush','archive_prune','storage_quota'],
- 'git-manager':['create','approve','dispatch','claim','prepare','validate','publish','settle','retry','cancel','finish','lock','release','export'],
+ 'git-manager':['create','approve','dispatch','claim','prepare','validate','publish','settle','retry','cancel','finish','lock','release','export','status'],
  'git-runner':['claim','prepare','validate','publish','settle','retry','finish','export','dependency_fetch'],
  'github-actions':['workflow','job','step','artifact','usage'], 'repository':['snapshot','pin','tag','production'],
  'cloudflare-worker':['request','alarm','deployment','usage'], 'r2':['read','write','delete','list','usage'],
@@ -17,6 +17,9 @@ const enums=(v,values)=>values.includes(v)?v:undefined;
 const stamp=v=>typeof v==='string'&&v.length<=40&&Number.isFinite(Date.parse(v))?new Date(v).toISOString():undefined;
 const version=v=>typeof v==='string'&&/^\d{1,4}\.\d{1,4}\.\d{1,4}(?:\.r\d{1,6})?$/.test(v)?v:undefined;
 const numeric=['durationMs','queueMs','serviceMs','requestChars','responseChars','driveCalls','driveRetries','indexHits','indexMisses','objectScans','driveHeaderMs','driveHeaderMaxMs','drive4xx','drive5xx','drive429','driveNetworkErrors','commitHeadMs','commitObjectsMs','commitRevisionMs','commitPublishMs','prepareMs','headMs','preflightMs','uploadMs','commitMs','sections','changed','reused','payloadBytes','objectsSent','objectsCreated','requests','hashed','hashesReused','serialized','identityReused','preflightReused','httpStatus','characters','reservedCharacters','bytes','count','cpuMs','runnerMs','storageBytes','limit','used','droppedEvents','cacheHits','cacheMisses'];
+// Status snapshots use a fixed allowlist, not arbitrary provider payloads.
+const statusFields={archive:['enabled','pending','droppedEvents','lastFlush','nextFlush','failures','archiveBytes','archiveCalls','archiveRetries','archive429','pruned','lastAttempt','alarmAt'],producer:['configured','pending','sent','dropped','failures','lastSent','alarmAt'],collector:['enabled','paused','cursor','pendingDetails','scans','details','requests','enqueued','truncated','backpressure','unavailableDetails','failures','detailFailures','expiredDetails','pendingOverflow','workflowListLimits','repoListLimits','detailRecordLimits','catchupTicks','detailOnlyTicks','resumes','alarmTicks','manualTicks','correlationFailures','dedupCacheEvictions','nextPoll','retryAt','pausedAt','expiresAt']};
+function statusSnapshot(v){if(!v||typeof v!=='object')return undefined;const out={};if(typeof v.manual==='boolean')out.manual=v.manual;if(Number.isSafeInteger(v.jobCount)&&v.jobCount>=0)out.jobCount=v.jobCount;for(const [group,fields] of Object.entries(statusFields)){const row={};for(const k of fields){const x=v[group]?.[k];if(typeof x==='boolean'||Number.isSafeInteger(x)&&x>=0||x===null)row[k]=x;}if(Object.keys(row).length)out[group]=row;}return Object.keys(out).length?out:undefined;}
 export function sanitizeEvent(v,{now=Date.now(),maxAge=30*DAY}={}){
  if(!v||v.schema!==SCHEMA||typeof v.eventId!=='string'||!uuid.test(v.eventId)||!Object.hasOwn(sources,v.source)||!sources[v.source].includes(v.operation))return null;
  const occurredAt=stamp(v.occurredAt);if(!occurredAt||Date.parse(occurredAt)<now-maxAge||Date.parse(occurredAt)>now+5*60000)return null;
@@ -31,6 +34,7 @@ export function sanitizeEvent(v,{now=Date.now(),maxAge=30*DAY}={}){
  const coverage=enums(v.coverage,['complete','partial','stale','unavailable','truncated','estimated']);if(coverage)out.coverage=coverage;
  const metrics={};for(const k of numeric){const n=v.metrics?.[k];if(typeof n==='number'&&Number.isFinite(n)&&n>=0&&n<=Number.MAX_SAFE_INTEGER)metrics[k]=n;}
  if(Object.keys(metrics).length)out.metrics=metrics;
+ if(v.source==='git-manager'&&v.operation==='status'){const d=statusSnapshot(v.diagnostics);if(d)out.diagnostics=d;}
  const c=v.correlation||{},correlation={};for(const k of ['jobId','attemptId','deploymentId'])if(typeof c[k]==='string'&&uuid.test(c[k]))correlation[k]=c[k].toLowerCase();
  for(const k of ['workflowRunId','runAttempt'])if(typeof c[k]==='string'&&/^\d{1,20}$/.test(c[k]))correlation[k]=c[k];
  if(repos.has(c.repo))correlation.repo=c.repo;if(typeof c.commit==='string'&&sha.test(c.commit))correlation.commit=c.commit;

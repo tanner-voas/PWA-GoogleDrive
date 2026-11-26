@@ -84,12 +84,12 @@ export default {async fetch(request,env){
 /** RPC only. Public fetch has no route to these functions. The calling Worker
  * must check its own administrator authorization before enrollment. */
 export async function telemetrySession(env,origin,cookieHeader,action,query=null){
- try{if(!['status','enable','disable','flush','drain','query','checkpoint-owner'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+ try{if(!['status','enable','managed-enable','disable','flush','drain','query','checkpoint-owner'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
  const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
  const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action,query});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
  if(action==='checkpoint-owner')return {ownerHash:hex(await crypto.subtle.digest('SHA-256',enc.encode(JSON.stringify([String(session.sub),data.epoch??null]))))};
- if(data.generation){const generation=data.generation,epoch=data.epoch;delete data.generation;delete data.epoch;data.capability=await sign({epoch,type:'workspace-telemetry',sub:session.sub,generation,exp:Date.now()+365*86400000},env);}
+ if(data.generation){const generation=data.generation,epoch=data.epoch;delete data.generation;delete data.epoch;data.capability=await sign({epoch,type:'workspace-telemetry',sub:session.sub,generation,exp:Date.now()+365*86400000},env);if(action==='managed-enable')data.controlCapability=await sign({epoch,type:'workspace-telemetry-control',sub:session.sub,generation,exp:Date.now()+365*86400000},env);}
  return data;
  }catch{return {error:'Telemetry service unavailable'};}
 }
@@ -99,17 +99,38 @@ export async function telemetryAppend(env,capability,events){
  const r=await internal(env.ACCOUNTS.get(env.ACCOUNTS.idFromName(token.sub)),'/workspace-telemetry/append',{generation:token.generation,epoch:token.epoch??null,events});return await r.json();
  }catch{return {error:'Telemetry service unavailable'};}
 }
+// Private RPC: a valid, current archive capability permits draining its own
+// generation without a browser session. It cannot enable a new generation.
+export async function telemetryControl(env,capability,action){
+ try{if(!['status','drain','disable'].includes(action))return {error:'Invalid telemetry action'};
+ const token=await unsign(capability,env);if(token?.type!=='workspace-telemetry-control'||!/^\d+$/.test(String(token.sub))||!ID.test(token.generation||''))return {error:'Telemetry capability expired or invalid'};
+ const r=await internal(env.ACCOUNTS.get(env.ACCOUNTS.idFromName(token.sub)),'/workspace-telemetry/control',{generation:token.generation,epoch:token.epoch??null,action});return await r.json();
+ }catch{return {error:'Telemetry service unavailable'};}
+}
 export class AccountCoordinator {
  constructor(ctx,env){this.ctx=ctx;this.env=env;this.access=null;this.queue=Promise.resolve();this.folderCache=new Map();this.metrics=null;this.telemetry=new NetworkTelemetry(ctx.storage);this.workspaceTelemetry=new WorkspaceTelemetry(ctx.storage);}
  async alarm(){return this.serial(async()=>{if(this.env.NETWORK_TELEMETRY==='off'){try{await this.telemetry.clear();}catch{}}else try{await this.telemetry.flush(this);}catch{console.warn('legacy-telemetry','flush-failed');}
-  await this.flushWorkspace();});}
+  await this.flushWorkspace();try{await this.flushRegularUsage();}catch{} });}
  async flushWorkspace(){ // called within the account's serialized queue
   this.metrics=freshMetrics();try{const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==(await this.ctx.storage.get('authorizationEpoch')??null))await this.workspaceTelemetry.disable();else await this.workspaceTelemetry.tick(this);}finally{const metrics=this.metrics;this.metrics=null;if(metrics.driveCalls)try{await this.workspaceTelemetry.addArchiveMetrics(metrics);}catch{} }
   // Legacy and v2 share one account alarm; re-arm after either writer changes it.
   await this.workspaceTelemetry.arm();}
- async appendTelemetry(records){const m=await this.workspaceTelemetry.meta();if(!m.enabled||m.epoch!==(await this.ctx.storage.get('authorizationEpoch')??null))return this.telemetry.append(records);
+ async appendTelemetry(records){const m=await this.workspaceTelemetry.meta(),active=m.enabled&&m.epoch===(await this.ctx.storage.get('authorizationEpoch')??null);if(!active)return this.recordRegularUsage(records);try{await this.recordRegularUsage(records);}catch{}
   const mapped=records.map(r=>adaptDriveSample(r,crypto.randomUUID())).filter(Boolean);if(!mapped.length)return false;
   const result=await this.workspaceTelemetry.append(mapped);return result.accepted+result.duplicates===mapped.length;
+ }
+ async recordRegularUsage(records){
+  // Account-wide request totals; profile backup data and app-local counters are
+  // unchanged. No individual request events are written in Regular mode.
+  const day=new Date().toISOString().slice(0,10),key='workspace-regular-usage',days=(await this.ctx.storage.get(key))||{};
+  const row=days[day]||{requests:0,driveCalls:0,driveRetries:0,requestChars:0,responseChars:0,backupCount:0};
+  for(const r of records){if(r.kind==='backup'){row.backupCount++;continue;}row.requests++;for(const k of ['driveCalls','driveRetries','requestChars','responseChars'])if(Number.isFinite(r[k])&&r[k]>=0)row[k]+=r[k];}
+  days[day]=row;await this.ctx.storage.put(key,Object.fromEntries(Object.entries(days).sort().slice(-31)));const due=await this.ctx.storage.get('workspace-regular-due')||Math.max(Date.now()+3600000,(await this.ctx.storage.get('workspace-regular-last-backup')||0)+86400000);await this.ctx.storage.put('workspace-regular-due',due);await this.armRegularUsage(due);return true;
+ }
+ async armRegularUsage(due){if(!this.ctx.storage.setAlarm)return;const old=await this.ctx.storage.getAlarm();if(old==null||old>due)await this.ctx.storage.setAlarm(Math.max(Date.now()+1000,due));}
+ async flushRegularUsage(){const s=this.ctx.storage,due=await s.get('workspace-regular-due');if(!due)return;if(!await s.get('refresh')){await s.delete('workspace-regular-due');return;}if(Date.now()<due){await this.armRegularUsage(due);return;}
+  try{const days=await s.get('workspace-regular-usage')||{},text=JSON.stringify({schema:1,kind:'workspace-regular-usage',days});const folder=await this.folder(await this.root(true),'telemetry',true);const files=(await this.list(folder,'regular-usage-v1.json',true)).filter(f=>f.appProperties?.pwaTelemetry==='regular-v1');if(files.length>1)throw Error('Ambiguous usage backup');let file=files[0];if(file){if(await this.content(file.id)!==text)await this.replaceJSON(file.id,text);}else file=await this.createJSON(folder,'regular-usage-v1.json',text,{appProperties:{pwaTelemetry:'regular-v1'}});if(!file?.id||await this.content(file.id)!==text)throw Error('Usage backup verification failed');await s.delete('workspace-regular-due');await s.put('workspace-regular-last-backup',Date.now());}
+  catch{const retry=Date.now()+3600000;await s.put('workspace-regular-due',retry);await this.armRegularUsage(retry);}
  }
  async fetch(request){const url=new URL(request.url);let input;try{input=await request.json();}catch{return error(400,'Invalid request');}
   if(url.pathname==='/login'){
@@ -128,7 +149,7 @@ export class AccountCoordinator {
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
    if(input.action==='checkpoint-owner')return json({epoch});
    if(input.action==='query'){const q=normalizeTelemetryQuery(input.query);if(!q)return error(400,'Invalid archive query');return json(await queryTelemetry(this,q));}
-   if(input.action==='enable'){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
+   if(['enable','managed-enable'].includes(input.action)){const generation=await this.workspaceTelemetry.enable(Date.now(),epoch);return json({...await this.workspaceTelemetry.status(),generation,epoch});}
    if(input.action==='disable'||input.action==='drain'){
     const m=await this.workspaceTelemetry.meta();
     if(m.enabled&&m.epoch!==epoch)return error(401,'Telemetry authorization expired');
@@ -137,6 +158,17 @@ export class AccountCoordinator {
      if(input.action==='disable')await this.workspaceTelemetry.disable();
     }
    }else if(input.action==='status'||input.action==='flush'){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)await this.workspaceTelemetry.disable();if(input.action==='flush'){if(!m.enabled||m.epoch!==epoch)return error(409,'Archive disabled');if(await this.workspaceTelemetry.requestFlush())await this.flushWorkspace();}await this.workspaceTelemetry.arm();}else return error(400,'Invalid telemetry action');
+   return json({...await this.workspaceTelemetry.status(),regularUsage:(await this.ctx.storage.get('workspace-regular-usage'))||{},regularUsageLastBackup:await this.ctx.storage.get('workspace-regular-last-backup')||null});
+  });
+  if(url.pathname==='/workspace-telemetry/control')return this.serial(async()=>{
+   const m=await this.workspaceTelemetry.meta(),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
+   if(!m.enabled||m.generation!==input.generation||m.epoch!==input.epoch||input.epoch!==epoch||!await this.ctx.storage.get('refresh'))return error(403,'Telemetry capability revoked');
+   if(!['status','drain','disable'].includes(input.action))return error(400,'Invalid telemetry action');
+   if(input.action!=='status'){
+    this.metrics=freshMetrics();let drained;try{drained=await this.workspaceTelemetry.drainPending(this);}finally{this.metrics=null;}
+    if(!drained)return json({...await this.workspaceTelemetry.status(),drainBlocked:true});
+    if(input.action==='disable')await this.workspaceTelemetry.disable();
+   }
    return json(await this.workspaceTelemetry.status());
   });
   if(url.pathname==='/workspace-telemetry/append')return this.serial(async()=>{
