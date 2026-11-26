@@ -1,4 +1,5 @@
 import {normalizeTelemetryQuery,queryTelemetry} from './telemetry-query.js';
+import {providerSample,addProviderTotals} from './provider-usage.js';
 import {WorkspaceTelemetry} from './workspace-telemetry.js';
 import pkg from '../package.json' with {type:'json'};
 import {adaptDriveSample,createEvent} from '../src/workspace-telemetry-schema.js';
@@ -93,6 +94,15 @@ export async function telemetrySession(env,origin,cookieHeader,action,query=null
  return data;
  }catch{return {error:'Telemetry service unavailable'};}
 }
+// Trusted Core Worker RPC for Google Translate; browser clients cannot submit
+// Google usage. Both paths verify the active account and epoch at ingestion.
+export async function translationUsage(env,origin,cookieHeader,sample){
+ try{if(!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid usage request'};
+ const session=await unsign(cookies(new Request(origin,{headers:{Cookie:cookieHeader}}))[SESSION],env);if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
+ const event=providerSample('google-translate',sample);if(!event)return {error:'Invalid usage sample'};
+ const r=await internal(env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub)),'/provider-usage',{sid:session.sid,sample});return r.json();
+ }catch{return {error:'Usage unavailable'};}
+}
 export async function telemetryAppend(env,capability,events){
  try{if(!Array.isArray(events)||events.length>64||new TextEncoder().encode(JSON.stringify(events)).length>262144)return {error:'Invalid telemetry batch'};
  const token=await unsign(capability,env);if(token?.type!=='workspace-telemetry'||!/^\d+$/.test(String(token.sub))||!ID.test(token.generation||''))return {error:'Telemetry capability expired or invalid'};
@@ -123,9 +133,17 @@ export class AccountCoordinator {
   // Account-wide request totals; profile backup data and app-local counters are
   // unchanged. No individual request events are written in Regular mode.
   const day=new Date().toISOString().slice(0,10),key='workspace-regular-usage',days=(await this.ctx.storage.get(key))||{};
-  const row=days[day]||{requests:0,driveCalls:0,driveRetries:0,requestChars:0,responseChars:0,backupCount:0};
+  const row={requests:0,driveCalls:0,driveRetries:0,requestChars:0,responseChars:0,backupCount:0,...days[day]};
   for(const r of records){if(r.kind==='backup'){row.backupCount++;continue;}row.requests++;for(const k of ['driveCalls','driveRetries','requestChars','responseChars'])if(Number.isFinite(r[k])&&r[k]>=0)row[k]+=r[k];}
   days[day]=row;await this.ctx.storage.put(key,Object.fromEntries(Object.entries(days).sort().slice(-31)));const due=await this.ctx.storage.get('workspace-regular-due')||Math.max(Date.now()+3600000,(await this.ctx.storage.get('workspace-regular-last-backup')||0)+86400000);await this.ctx.storage.put('workspace-regular-due',due);await this.armRegularUsage(due);return true;
+ }
+ async recordProviderUsage(source,sample){
+  const now=Date.now(),event=providerSample(source,sample,now);if(!event)return error(400,'Invalid usage sample');
+  const s=this.ctx.storage,key='workspace-regular-usage',idsKey='workspace-provider-recent',day=new Date(now).toISOString().slice(0,10);
+  const accepted=await s.transaction(async tx=>{const recent=(await tx.get(idsKey))||[];if(recent.includes(event.eventId))return false;const days=(await tx.get(key))||{};days[day]=addProviderTotals(days[day]||{},event);await tx.put(key,Object.fromEntries(Object.entries(days).sort().slice(-31)));await tx.put(idsKey,[...recent,event.eventId].slice(-512));return true;});
+  const due=await s.get('workspace-regular-due')||Math.max(now+3600000,(await s.get('workspace-regular-last-backup')||0)+86400000);await s.put('workspace-regular-due',due);await this.armRegularUsage(due);
+  if(accepted){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch===(await s.get('authorizationEpoch')??null))try{await this.workspaceTelemetry.append([event],now,m.generation);}catch{}}
+  return json({accepted,duplicate:!accepted});
  }
  async armRegularUsage(due){if(!this.ctx.storage.setAlarm)return;const old=await this.ctx.storage.getAlarm();if(old==null||old>due)await this.ctx.storage.setAlarm(Math.max(Date.now()+1000,due));}
  async flushRegularUsage(){const s=this.ctx.storage,due=await s.get('workspace-regular-due');if(!due)return;if(!await s.get('refresh')){await s.delete('workspace-regular-due');return;}if(Date.now()<due){await this.armRegularUsage(due);return;}
@@ -144,6 +162,7 @@ export class AccountCoordinator {
    };
    return this.serial(run);
   }
+  if(url.pathname==='/provider-usage')return this.serial(async()=>{const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Usage authorization expired');return this.recordProviderUsage('google-translate',input.sample);});
   if(url.pathname==='/workspace-telemetry/session')return this.serial(async()=>{
    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
@@ -157,7 +176,7 @@ export class AccountCoordinator {
      if(!drained)return json({...await this.workspaceTelemetry.status(),drainBlocked:true});
      if(input.action==='disable')await this.workspaceTelemetry.disable();
     }
-   }else if(input.action==='status'||input.action==='flush'){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)await this.workspaceTelemetry.disable();if(input.action==='flush'){if(!m.enabled||m.epoch!==epoch)return error(409,'Archive disabled');if(await this.workspaceTelemetry.requestFlush())await this.flushWorkspace();}await this.workspaceTelemetry.arm();}else return error(400,'Invalid telemetry action');
+   }else if(input.action==='status'||input.action==='flush'){const m=await this.workspaceTelemetry.meta();if(m.enabled&&m.epoch!==epoch)return error(409,'Archive authorization changed');if(input.action==='flush'){if(!m.enabled)return error(409,'Archive disabled');if(await this.workspaceTelemetry.requestFlush())await this.flushWorkspace();await this.workspaceTelemetry.arm();}}else return error(400,'Invalid telemetry action');
    return json({...await this.workspaceTelemetry.status(),regularUsage:(await this.ctx.storage.get('workspace-regular-usage'))||{},regularUsageLastBackup:await this.ctx.storage.get('workspace-regular-last-backup')||null});
   });
   if(url.pathname==='/workspace-telemetry/control')return this.serial(async()=>{
@@ -189,6 +208,7 @@ export class AccountCoordinator {
     if(this.env.NETWORK_TELEMETRY!=='off'&&await this.telemetry.enabled()){
      try{scope=hex(await crypto.subtle.digest('SHA-256',enc.encode('pwa-telemetry-v1:'+input.sid)));samples=readClientSamples(input.telemetry,scope);label=classifyRequest(input.method,input.path,input.telemetryApp);}catch{}
     }
+    if(input.path==='/usage/azure-speech'&&input.method==='POST'){if(!await this.ctx.storage.get('refresh'))return error(401,'Usage authorization expired');if(typeof input.body!=='string'||input.body.length>2048)return error(400,'Invalid usage sample');let sample;try{sample=JSON.parse(input.body);}catch{return error(400,'Invalid usage sample');}return await this.recordProviderUsage('azure-speech',sample);}
     if(input.path==='/status'&&input.method==='GET')response=json({connected:true,email:session.email});
     else{this.metrics=freshMetrics();response=await this.route(input);}
    }catch(e){const msg=String(e.message||e);const code=/Drive API (403|404|429|5\d\d)/.exec(msg)?.[1];response=msg.startsWith('Google authorization expired')?error(401,msg):msg.startsWith('Conflict:')?error(409,msg.slice(9)):error(502,code?`Google Drive returned HTTP ${code}; local data is safe. Retry or check Cloudflare logs.`:'Google Drive operation failed. Local data is safe; retry later.',{stage:input.path});}
