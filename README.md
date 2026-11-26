@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.22
+# PWA-GoogleDrive v0.1.23
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
