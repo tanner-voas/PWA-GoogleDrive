@@ -86,7 +86,7 @@ export default {async fetch(request,env){
 /** RPC only. Public fetch has no route to these functions. The calling Worker
  * must check its own administrator authorization before enrollment. */
 export async function telemetrySession(env,origin,cookieHeader,action,query=null){
- try{if(!['status','enable','managed-enable','disable','flush','drain','query','checkpoint-owner','storage-quota','storage-quota-cached'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
+ try{if(!['status','enable','managed-enable','disable','flush','drain','query','checkpoint-owner','storage-quota','storage-quota-cached','storage-quota-refresh'].includes(action)||!originAllowed(new URL(origin),env)||typeof cookieHeader!=='string'||cookieHeader.length>8192)return {error:'Invalid telemetry request'};
  const request=new Request(origin,{headers:{Cookie:cookieHeader}}),session=await unsign(cookies(request)[SESSION],env);
  if(!session||session.type||!/^\d+$/.test(String(session.sub))||!ID.test(session.sid||''))return {error:'Connect Google Drive'};
  const stub=env.ACCOUNTS.get(env.ACCOUNTS.idFromName(session.sub));const r=await internal(stub,'/workspace-telemetry/session',{sid:session.sid,action,query});const data=await r.json();if(!r.ok)return {error:'Telemetry authorization unavailable'};
@@ -168,9 +168,9 @@ export class AccountCoordinator {
    const session=await this.ctx.storage.get(`session:${input.sid}`),epoch=await this.ctx.storage.get('authorizationEpoch')??null;
    if(!session||session.exp<=Date.now()||(session.epoch??null)!==epoch||!await this.ctx.storage.get('refresh'))return error(401,'Telemetry authorization expired');
    if(input.action==='checkpoint-owner')return json({epoch});
-   if(['storage-quota','storage-quota-cached'].includes(input.action)){
+   if(['storage-quota','storage-quota-cached','storage-quota-refresh'].includes(input.action)){
     const key='workspace-storage-quota-v1',now=Date.now(),old=await this.ctx.storage.get(key);
-    if(old?.epoch===epoch&&(input.action==='storage-quota-cached'||now>=old.at&&now-old.at<15*60000))return json(old.result);
+    if(old?.epoch===epoch&&(input.action==='storage-quota-cached'||now>=old.at&&now-old.at<(input.action==='storage-quota-refresh'?60000:15*60000)))return json(old.result);
     if(input.action==='storage-quota-cached')return json({state:'no-data'});
     let result;try{const quota=await this.telemetryStorageQuota();result={state:Object.keys(quota).length?'available':'no-data',at:now,quota};}catch{result={state:'unavailable',at:now};}
     await this.ctx.storage.put(key,{epoch,at:now,result});return json(result);
