@@ -1,3 +1,4 @@
+import {captureUsage,recordProfileUsage} from './profile-usage.js';
 import {beginTelemetry} from './network-telemetry.js';
 /** One profile identity across apps on the SAME origin; never stores Google secrets. */
 const KEY='pwa.profiles.v1';
@@ -69,9 +70,9 @@ export function upsertProfile({id,name,remote=false},storage){if(!/^[a-zA-Z0-9_-
 export function forkProfile(sourceId,name,storage){const id=globalThis.crypto.randomUUID();upsertProfile({id,name,remote:false},storage);return id;}
 export async function api(path='',opts={}){
  const {onResponse,telemetryApp,...requestOptions}=opts;
- const telemetry=beginTelemetry(telemetryApp);let response;
+ const telemetry=beginTelemetry(telemetryApp),match=/^\/profiles\/([A-Za-z0-9_-]{1,80})(?:\/|$)/.exec(path),usage=match?captureUsage(match[1],{deferScope:true}):null;let response;
  try{response=await fetch(`${cloudEndpoint}${path}`,{credentials:'same-origin',...requestOptions,headers:{...(opts.body?{'Content-Type':'application/json','X-PWA-CSRF':'1'}:{}),...opts.headers,...telemetry.headers}});}
- finally{telemetry.finish(response);}
+ finally{telemetry.finish(response);if(usage){const n=Number(response?.headers?.get('X-PWA-driveCalls'));const scope=response?.headers?.get('X-PWA-Profile-Usage-Scope');if(Number.isSafeInteger(n)&&n>0&&ID.test(scope||''))void recordProfileUsage({...usage,scope},{driveCalls:n});}}
  try{onResponse?.(response);}catch{}
  const json=await response.json().catch(()=>({error:`HTTP ${response.status}`}));
  if(!response.ok){const e=new Error(json.error||`HTTP ${response.status}`);e.status=response.status;e.details=json;throw e;}

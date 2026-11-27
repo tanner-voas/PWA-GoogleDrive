@@ -1,3 +1,4 @@
+import {mergeProfileRows} from './profile-usage.js';
 import {normalizeTelemetryQuery,queryTelemetry} from './telemetry-query.js';
 import {providerSample,addProviderTotals} from './provider-usage.js';
 import {WorkspaceTelemetry} from './workspace-telemetry.js';
@@ -147,7 +148,7 @@ export class AccountCoordinator {
  }
  async armRegularUsage(due){if(!this.ctx.storage.setAlarm)return;const old=await this.ctx.storage.getAlarm();if(old==null||old>due)await this.ctx.storage.setAlarm(Math.max(Date.now()+1000,due));}
  async flushRegularUsage(){const s=this.ctx.storage,due=await s.get('workspace-regular-due');if(!due)return;if(!await s.get('refresh')){await s.delete('workspace-regular-due');return;}if(Date.now()<due){await this.armRegularUsage(due);return;}
-  try{const days=await s.get('workspace-regular-usage')||{},text=JSON.stringify({schema:1,kind:'workspace-regular-usage',days});const folder=await this.folder(await this.root(true),'telemetry',true);const files=(await this.list(folder,'regular-usage-v1.json',true)).filter(f=>f.appProperties?.pwaTelemetry==='regular-v1');if(files.length>1)throw Error('Ambiguous usage backup');let file=files[0];if(file){if(await this.content(file.id)!==text)await this.replaceJSON(file.id,text);}else file=await this.createJSON(folder,'regular-usage-v1.json',text,{appProperties:{pwaTelemetry:'regular-v1'}});if(!file?.id||await this.content(file.id)!==text)throw Error('Usage backup verification failed');await s.delete('workspace-regular-due');await s.put('workspace-regular-last-backup',Date.now());await s.delete('workspace-regular-backup-error');}
+  try{const days=await s.get('workspace-regular-usage')||{},profileRows=mergeProfileRows(await s.get('profile-usage-rows')||[],[],await s.get('profile-usage-scope')),text=JSON.stringify({schema:1,kind:'workspace-regular-usage',days,...(profileRows.length?{profileRows}:{})});const folder=await this.folder(await this.root(true),'telemetry',true);const files=(await this.list(folder,'regular-usage-v1.json',true)).filter(f=>f.appProperties?.pwaTelemetry==='regular-v1');if(files.length>1)throw Error('Ambiguous usage backup');let file=files[0];if(file){if(await this.content(file.id)!==text)await this.replaceJSON(file.id,text);}else file=await this.createJSON(folder,'regular-usage-v1.json',text,{appProperties:{pwaTelemetry:'regular-v1'}});if(!file?.id||await this.content(file.id)!==text)throw Error('Usage backup verification failed');await s.delete('workspace-regular-due');await s.put('workspace-regular-last-backup',Date.now());await s.delete('workspace-regular-backup-error');}
   catch{const retry=Date.now()+3600000;await s.put('workspace-regular-backup-error','verification-unavailable');await s.put('workspace-regular-due',retry);await this.armRegularUsage(retry);}
  }
  async fetch(request){const url=new URL(request.url);let input;try{input=await request.json();}catch{return error(400,'Invalid request');}
@@ -215,6 +216,11 @@ export class AccountCoordinator {
     if(this.env.NETWORK_TELEMETRY!=='off'&&await this.telemetry.enabled()){
      try{scope=hex(await crypto.subtle.digest('SHA-256',enc.encode('pwa-telemetry-v1:'+input.sid)));samples=readClientSamples(input.telemetry,scope);label=classifyRequest(input.method,input.path,input.telemetryApp);}catch{}
     }
+    if((input.path==='/usage/profiles'&&['GET','POST'].includes(input.method))||(input.path==='/usage/profile-scope'&&input.method==='GET')){
+     const s=this.ctx.storage;let scope=await s.get('profile-usage-scope');if(!scope){scope=rand();await s.put('profile-usage-scope',scope);}if(input.path==='/usage/profile-scope')return json({scope});const old=await s.get('profile-usage-rows')||[];
+     if(input.method==='GET')return json({scope,rows:mergeProfileRows(old,[],scope)});
+     if(typeof input.body!=='string'||input.body.length>24000)return error(400,'Invalid usage snapshots');try{const data=JSON.parse(input.body);if(data.scope!==scope)return error(409,'Usage account changed');const rows=mergeProfileRows(old,data.rows,scope);await s.put('profile-usage-rows',rows);const due=await s.get('workspace-regular-due')||Math.max(Date.now()+3600000,(await s.get('workspace-regular-last-backup')||0)+86400000);await s.put('workspace-regular-due',due);await this.armRegularUsage(due);return json({accepted:true});}catch{return error(400,'Invalid or excessive usage snapshots');}
+    }
     if(input.path==='/usage/azure-speech'&&input.method==='POST'){if(!await this.ctx.storage.get('refresh'))return error(401,'Usage authorization expired');if(typeof input.body!=='string'||input.body.length>2048)return error(400,'Invalid usage sample');let sample;try{sample=JSON.parse(input.body);}catch{return error(400,'Invalid usage sample');}return await this.recordProviderUsage('azure-speech',sample);}
     if(input.path==='/status'&&input.method==='GET')response=json({connected:true,email:session.email});
     else{this.metrics=freshMetrics();response=await this.route(input);}
@@ -223,6 +229,7 @@ export class AccountCoordinator {
    const metrics=this.metrics;this.metrics=null;
    const headers=new Headers(response.headers);
    if(metrics)for(const [key,value] of Object.entries(metrics))headers.set(`X-PWA-${key}`,String(value));
+   if(metrics?.driveCalls>0&&/^\/profiles\/[A-Za-z0-9_-]{1,80}(?:\/|$)/.test(input.path))try{const s=this.ctx.storage;let usageScope=await s.get('profile-usage-scope');if(!usageScope){usageScope=rand();await s.put('profile-usage-scope',usageScope);}headers.set('X-PWA-Profile-Usage-Scope',usageScope);}catch{}
    if(scope){
     headers.set('X-PWA-Telemetry-Scope',scope);
     try{const records=samples?[...samples]:[];
