@@ -1,4 +1,4 @@
-# PWA-GoogleDrive v0.1.26
+# PWA-GoogleDrive v0.1.27
 
 Shared **local-first profile management** and Google Drive backup/synchronization for AppLauncher and Ciyan. Submodule: `shared/google-drive` in both repos.
 
@@ -78,3 +78,6 @@ Ciyan-specific data fields. No additional app is cloud-enabled by this release.
 
 ## Unified telemetry foundation
 See `WORKSPACE_TELEMETRY.md`. Existing network-v1 files and behavior are preserved until explicit enrollment from GitManager.
+
+### Profile usage reliability (R16B)
+Regular usage snapshots bind to the account verified at operation start (or the scoped Drive response). Unlinked observations are never automatically assigned to a subsequent account. Explicit hosted refresh reconciles acknowledged snapshots against cloud state; cumulative max merging avoids duplicate increments. Snapshot acknowledgement is independent of backup alarm scheduling. Usage observations remain distinct from provider billing.

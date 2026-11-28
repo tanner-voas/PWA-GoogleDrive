@@ -46,3 +46,14 @@ test('CSRF, cross-origin requests and tampered cookies are rejected before accou
  for(const extra of [{},{'X-PWA-CSRF':'1',Origin:'https://evil.test'},{'X-PWA-CSRF':'1','Sec-Fetch-Site':'cross-site'}])assert.equal((await worker.fetch(new Request(base,{method:'POST',headers:{...headers,...extra},body:'{}'}),env)).status,403);
  const res=await worker.fetch(new Request(base,{method:'POST',headers:{Cookie:headers.Cookie+'x','X-PWA-CSRF':'1'},body:'{}'}),env);assert.equal(res.status,401);
 });
+
+test('profile usage snapshots are account-scoped, durable before acknowledgement and retry-idempotent',async()=>{
+ const {store,coord,call}=await fixture();const scope=(await (await call('a','/usage/profile-scope')).json()).scope;
+ const row={scope,profile:'p',writer:'w',day:new Date().toISOString().slice(0,10),counts:{speechCharacters:13}};
+ coord.armRegularUsage=async()=>{throw Error('alarm unavailable');};
+ assert.equal((await call('a','/usage/profiles','POST',{scope:'foreign',rows:[row]})).status,409);
+ assert.equal((await (await call('a','/usage/profiles','POST',{scope,rows:[row]})).json()).accepted,true);
+ assert.equal((await call('b','/usage/profiles','POST',{scope,rows:[row]})).status,200);
+ const result=await (await call('c','/usage/profiles')).json();assert.equal(result.rows.length,1);assert.equal(result.rows[0].counts.speechCharacters,13);assert.equal((await store.get('profile-usage-rows')).length,1);
+ await call('a','/logout','POST');assert.equal((await call('a','/usage/profiles')).status,401);
+});

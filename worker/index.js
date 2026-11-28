@@ -219,7 +219,7 @@ export class AccountCoordinator {
     if((input.path==='/usage/profiles'&&['GET','POST'].includes(input.method))||(input.path==='/usage/profile-scope'&&input.method==='GET')){
      const s=this.ctx.storage;let scope=await s.get('profile-usage-scope');if(!scope){scope=rand();await s.put('profile-usage-scope',scope);}if(input.path==='/usage/profile-scope')return json({scope});const old=await s.get('profile-usage-rows')||[];
      if(input.method==='GET')return json({scope,rows:mergeProfileRows(old,[],scope)});
-     if(typeof input.body!=='string'||input.body.length>24000)return error(400,'Invalid usage snapshots');try{const data=JSON.parse(input.body);if(data.scope!==scope)return error(409,'Usage account changed');const rows=mergeProfileRows(old,data.rows,scope);await s.put('profile-usage-rows',rows);const due=await s.get('workspace-regular-due')||Math.max(Date.now()+3600000,(await s.get('workspace-regular-last-backup')||0)+86400000);await s.put('workspace-regular-due',due);await this.armRegularUsage(due);return json({accepted:true});}catch{return error(400,'Invalid or excessive usage snapshots');}
+     if(typeof input.body!=='string'||input.body.length>24000)return error(400,'Invalid usage snapshots');try{const data=JSON.parse(input.body);if(data.scope!==scope)return error(409,'Usage account changed');const rows=mergeProfileRows(old,data.rows,scope);await s.put('profile-usage-rows',rows);try{const due=await s.get('workspace-regular-due')||Math.max(Date.now()+3600000,(await s.get('workspace-regular-last-backup')||0)+86400000);await s.put('workspace-regular-due',due);await this.armRegularUsage(due);}catch{/* Snapshot is already durable; backup scheduling must not misreport its acceptance. */}return json({accepted:true});}catch{return error(400,'Invalid or excessive usage snapshots');}
     }
     if(input.path==='/usage/azure-speech'&&input.method==='POST'){if(!await this.ctx.storage.get('refresh'))return error(401,'Usage authorization expired');if(typeof input.body!=='string'||input.body.length>2048)return error(400,'Invalid usage sample');let sample;try{sample=JSON.parse(input.body);}catch{return error(400,'Invalid usage sample');}return await this.recordProviderUsage('azure-speech',sample);}
     if(input.path==='/status'&&input.method==='GET')response=json({connected:true,email:session.email});
@@ -229,7 +229,7 @@ export class AccountCoordinator {
    const metrics=this.metrics;this.metrics=null;
    const headers=new Headers(response.headers);
    if(metrics)for(const [key,value] of Object.entries(metrics))headers.set(`X-PWA-${key}`,String(value));
-   if(metrics?.driveCalls>0&&/^\/profiles\/[A-Za-z0-9_-]{1,80}(?:\/|$)/.test(input.path))try{const s=this.ctx.storage;let usageScope=await s.get('profile-usage-scope');if(!usageScope){usageScope=rand();await s.put('profile-usage-scope',usageScope);}headers.set('X-PWA-Profile-Usage-Scope',usageScope);}catch{}
+   if((metrics?.driveCalls>0&&/^\/profiles\/[A-Za-z0-9_-]{1,80}(?:\/|$)/.test(input.path))||(input.method==='GET'&&input.path==='/profiles'&&response.ok))try{const s=this.ctx.storage;let usageScope=await s.get('profile-usage-scope');if(!usageScope){usageScope=rand();await s.put('profile-usage-scope',usageScope);}headers.set('X-PWA-Profile-Usage-Scope',usageScope);}catch{}
    if(scope){
     headers.set('X-PWA-Telemetry-Scope',scope);
     try{const records=samples?[...samples]:[];
